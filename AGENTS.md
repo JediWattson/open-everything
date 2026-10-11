@@ -1,0 +1,97 @@
+# open-everything
+
+Decompilation harness for research: Ghidra headless extracts per-function
+pseudocode + call-graph context, functions are embedded with a local model,
+and stored in LanceDB for semantic search ("RAG over a binary").
+
+## Layout
+
+- `src/openeverything/extractor.py` — PyGhidra extractor: decompiles every
+  function, collects callees/callers, referenced strings, thunks/externals.
+- `src/openeverything/embed.py` — `build_embed_text` (signature + calls +
+  called-by + strings + body) and the SentenceTransformer `Embedder`.
+- `src/openeverything/store.py` — LanceDB tables `functions` (one row per
+  function incl. vector) and `binaries` (registry keyed by sha256).
+- `src/openeverything/graph.py` — SQLite `edges` table (name-keyed
+  caller→callee per binary) for multi-hop call-graph traversal via
+  recursive CTEs. Derived index — rebuilt from `callees` on ingest.
+- `src/openeverything/llm.py` — local LLM backend for `oe ask`: in-process
+  mlx-lm on Metal, or a running Ollama server (`OE_LLM_BACKEND`,
+  `OE_LLM_MODEL`).
+- `src/openeverything/agent.py` — agent loop for `oe agent`: the LLM emits one
+  JSON action per turn (`{"tool": ..., "args": ...}` / `{"answer": ...}`) and
+  can call search/show/graph/functions; observations are fed back truncated.
+- `src/openeverything/lift.py` — whole-binary lift for `oe lift`: visits
+  functions callee-first (call-graph post-order), rewrites each via the LLM
+  into a named/typed/documented function, and threads a shared symbol table
+  so callers see lifted callee signatures. Emits `lifted/<bin>/{decls.h,
+  lifted.cpp, lift_report.json}`. Exact-body dedupe merges identical bodies;
+  output is best-effort readable C++, not guaranteed-compilable.
+- `src/openeverything/pipeline.py` — ingest orchestration.
+- `src/openeverything/cli.py` — `oe` CLI (typer + rich).
+
+## Setup
+
+```sh
+./setup.sh            # or: make setup / cmake --build build --target setup
+./setup.sh --check    # verify only, install nothing
+```
+
+which wraps (manual equivalent):
+
+```sh
+python3 -m venv .venv && .venv/bin/pip install -e ".[dev,llm]"
+brew install openjdk@21 ghidra   # formula, not cask — bottle builds mac natives
+```
+
+Notes:
+- The official Ghidra release zip does NOT ship macOS decompiler natives;
+  the Homebrew formula bottle does. Point `GHIDRA_INSTALL_DIR` at any install
+  containing `support/analyzeHeadless` to override autodiscovery.
+- `JAVA_HOME` is auto-resolved to a keg-only openjdk install if unset.
+- `OE_HOME` (default `~/open-everything`) holds `lancedb/`, `graph.db`, and
+  `ghidra-projects/`. It must not contain hidden path elements (`.*`) —
+  Ghidra's `ProjectLocator` rejects them.
+- Embedding model: `Qodo/Qodo-Embed-1-1.5B` by default (code-specialized,
+  bidirectional attention, 1536-dim). Its bundled remote code predates
+  transformers 5.x, so `Embedder` falls back to the native qwen2 arch and
+  patches `create_causal_mask` -> `create_bidirectional_mask` when
+  `config.is_causal` is false (`embed.py:_force_bidirectional`).
+- Device: MPS (Metal) is auto-detected; `OE_DEVICE=cpu` forces CPU. On MPS the
+  model loads bf16 — fp32 OOMs a 16 GB unified-memory Mac. Embed batch is 16
+  for the same reason.
+- Rows are tagged with `model` and search filters on it. Vector dims differ
+  per model (qodo 1536, gemma 768), so switching models requires wiping or
+  re-ingesting the whole index — mixing dims in one table errors.
+- Other options: `unsloth/embeddinggemma-300m` (ungated ST mirror of the
+  license-gated `google/embeddinggemma-300m`), `google/embeddinggemma-2`
+  (multimodal, needs pillow + torchvision). jina-embeddings-v2-* breaks on
+  transformers 5.x (remote-code import error).
+- `graph.db` edges are derived from the `callees` column at ingest time.
+  Binaries indexed before the graph store existed can be backfilled from
+  LanceDB (`name` + `callees` per row) without re-decompiling.
+
+## Commands
+
+```sh
+oe ingest <binary>... [--force] [-m model]      # decompile + embed + index
+oe search "<query>" [-k N] [-b bin] [-m model] [--code] [--all]
+oe show <func> -b <binary>          # print pseudocode
+oe graph <func> -b <binary> [-d N] [--callers]   # transitive call graph
+oe ask "<question>" [-b bin] [-k N] [--llm M] [--context-only]  # RAG → local LLM
+oe agent "<goal>" [-b bin] [--iters N] [-q]     # agentic tool-use loop
+oe lift <binary> [-o dir] [-n N] [--llm M]      # whole-binary → lifted/*.cpp
+oe functions <binary>               # list functions
+oe binaries                         # list indexed binaries
+oe rm <binary>                      # drop from index
+oe doctor                           # environment check
+```
+
+## Verify
+
+```sh
+.venv/bin/python -m pytest tests/ -q   # unit tests (no Ghidra/model needed)
+.venv/bin/oe ingest /bin/ls            # smoke test, ~1 min after model cached
+.venv/bin/oe search "print file size" -k 5
+.venv/bin/oe graph entry -b ls -d 3    # NB: leaf functions legitimately print "no callees"
+```
