@@ -203,3 +203,17 @@ def test_agent_logs_trajectory(tmp_path):
     assert rec["messages"][0]["role"] == "system"
     assert rec["messages"][-1] == {"role": "assistant",
                                    "content": '{"answer": "done"}'}
+
+
+def test_cluster_order_callees_first():
+    from openeverything.lift import _cluster_order
+
+    gA = [{"name": "a", "callees": ["b"]}]
+    gB = [{"name": "b", "callees": []}]
+    groups = _cluster_order([gA, gB])
+    assert [g[0]["name"] for g in groups] == ["b", "a"]
+
+    # cycle between clusters doesn't hang
+    gC = [{"name": "c", "callees": ["d"]}]
+    gD = [{"name": "d", "callees": ["c"]}]
+    assert len(_cluster_order([gC, gD])) == 2

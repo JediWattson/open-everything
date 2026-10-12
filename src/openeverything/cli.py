@@ -263,10 +263,12 @@ def lift(
     out: Path = typer.Option(Path("lifted"), "--out", "-o", help="Output root (gets <out>/<binary>/)"),
     limit: int = typer.Option(0, "--limit", "-n", help="Lift only first N functions (callee-first order)"),
     llm_model: str | None = typer.Option(None, "--llm"),
+    clustered: bool = typer.Option(False, "--clustered", help="Cluster-aware module lift (arch v2)"),
+    threshold: float = typer.Option(0.25, "-t", help="Cluster merge threshold (clustered mode)"),
 ):
     """Lift all functions to coherent C++ via a shared symbol table."""
     from . import llm
-    from .lift import lift_binary
+    from .lift import lift_binary, lift_binary_clustered
 
     store = Store()
     sha = _resolve_sha(store, binary)
@@ -282,12 +284,15 @@ def lift(
             prog.update(task, completed=i,
                         description=f"[cyan]lifting {name}[/] {fname}")
 
-        out_dir, symbols = lift_binary(
+        lift_fn = lift_binary_clustered if clustered else lift_binary
+        kw = {"threshold": threshold} if clustered else {}
+        out_dir, symbols = lift_fn(
             store, sha, name,
             chat=lambda m, tools=None, temp=None: llm.chat(m, model=llm_model, tools=tools, temp=temp),
             out_dir=out / name,
             limit=limit,
             on_progress=on_prog,
+            **kw,
         )
     failed = sum(1 for s in symbols.values() if s["failed"])
     console.print(
@@ -397,16 +402,36 @@ def clusters(
     llm_model: str | None = typer.Option(None, "--llm"),
     model: str | None = typer.Option(None, "--model", "-m"),
     out: Path | None = typer.Option(None, "--out", "-o", help="Write cluster map JSON"),
+    asm: bool = typer.Option(False, "--asm", help="Embed raw disassembly instead of Ghidra pseudocode"),
 ):
     """Group a binary's functions into subsystem clusters (embedding-based)."""
-    from .cluster import cluster_functions, label_clusters, load_rows
+    from .cluster import (
+        asm_embed_text, cluster_functions, disasm_functions,
+        label_clusters, load_rows,
+    )
 
     store = Store()
     sha = _resolve_sha(store, binary)
     indexed = store.distinct_models()
     if model is None and len(indexed) == 1:
         model = indexed.pop()
-    rows = load_rows(store, sha, model or "")
+    if asm:
+        bins = {b["binary_sha256"]: b for b in store.list_binaries()}
+        rows = load_rows(store, sha, model or "")
+        asm_map = disasm_functions(
+            Path(bins[sha]["path"]), rows)
+        emb = _embedder(model)
+        texts = [
+            asm_embed_text(r["name"], asm_map.get(r["name"], ""), binary)
+            for r in rows
+        ]
+        vecs = emb.embed_docs(texts)
+        rows = [
+            {**r, "vector": v, "callees": [], "strings": []}
+            for r, v in zip(rows, vecs)
+        ]
+    else:
+        rows = load_rows(store, sha, model or "")
     groups = cluster_functions(rows, threshold)
 
     labels = [""] * len(groups)

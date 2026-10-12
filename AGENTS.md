@@ -99,6 +99,9 @@ oe agent "<goal>" [-b bin] [--iters N] [-q]     # agentic tool-use loop
 oe chat [-b bin]                    # interactive REPL — persistent agent session
                                     #   /bin /binaries /search /show /graph /funcs /clear /quit
 oe lift <binary> [-o dir] [-n N] [--llm M]      # whole-binary → lifted/*.cpp
+oe lift <binary> --clustered [-t 0.25]          # arch v2: module prepass →
+                                    # per-fn lift with module context →
+                                    # modules/NN_label.{h,cpp} + decls.h
 oe match <a> <b> [-n N]             # cross-binary function alignment (cosine sim)
 oe clusters <bin> [-t 0.25] [--label] [--out map.json]
                                     # subsystem clustering on embeddings
