@@ -200,6 +200,13 @@ def lift_binary(
         for name in unlifted:
             sig = all_rows.get(name, {}).get("signature") or f"void {name}(void)"
             decls.append(f"{sig.rstrip(';')};")
+    # Enforce unresolved call-sites: give them a visibly-flagged stub decl so
+    # lifted.cpp stays self-contained while the report still counts them.
+    invented = sorted({n for s in symbols.values() for n in s["unresolved"]})
+    if invented:
+        decls += ["", "// call sites with no matching symbol in the binary:"]
+        for n in invented:
+            decls.append(f"void {n}(void);  // unresolved — likely LLM-invented")
     if aliases:
         decls += ["", "// unresolved originals:"]
         for fun, alias in aliases.items():

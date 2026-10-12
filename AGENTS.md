@@ -21,6 +21,12 @@ and stored in LanceDB for semantic search ("RAG over a binary").
 - `src/openeverything/agent.py` — agent loop for `oe agent`: the LLM emits one
   JSON action per turn (`{"tool": ..., "args": ...}` / `{"answer": ...}`) and
   can call search/show/graph/functions; observations are fed back truncated.
+- `src/openeverything/agent.py` — tool loop. Tool args are validated by
+  pydantic schemas (validation errors become self-correctable observations);
+  identical repeat calls replay cached results; fabricated tool transcripts
+  are rejected. Native `<tool_call>` format via chat-template `tools=` is the
+  default (`native=True`); legacy `{"tool": ...}` JSON parsing remains as a
+  fallback path. `llm.chat(..., temp=0)` for deterministic tool emission.
 - `src/openeverything/lift.py` — whole-binary lift for `oe lift`: visits
   functions callee-first (call-graph post-order), rewrites each via the LLM
   into a named/typed/documented function, and threads a shared symbol table

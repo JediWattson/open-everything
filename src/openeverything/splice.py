@@ -167,6 +167,14 @@ def splice(
             rf"\b{re.escape(s['name'])}\b", rename[orig], s["signature"], count=1
         )
         decls.append(f"{new_sig.rstrip(';')};  // from {orig}")
+    # Unbound donor references — DAT_/PTR_/FUN_ outside the slice — get a
+    # commented placeholder decl so the merged file stays honest about what
+    # still needs manual binding.
+    unbound = sorted({n for v in unresolved.values() for n in v})
+    if unbound:
+        decls += ["", "// unbound donor references (need manual binding):"]
+        for n in unbound:
+            decls.append(f"// extern ??? {n};")
     (out_dir / "decls.h").write_text("\n".join(decls))
 
     src = [

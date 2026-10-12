@@ -26,7 +26,10 @@ def _ollama_reachable() -> bool:
         return False
 
 
-def _mlx_chat(messages: list[dict], model_name: str, max_tokens: int):
+def _mlx_chat(
+    messages: list[dict], model_name: str, max_tokens: int,
+    tools: list[dict] | None = None, temp: float | None = None,
+):
     global _mlx_cache
     from mlx_lm import generate, load, stream_generate
 
@@ -34,9 +37,16 @@ def _mlx_chat(messages: list[dict], model_name: str, max_tokens: int):
         _mlx_cache = (model_name, *load(model_name))
     _, model, tokenizer = _mlx_cache
     prompt = tokenizer.apply_chat_template(
-        messages, tokenize=False, add_generation_prompt=True
+        messages, tools=tools, tokenize=False, add_generation_prompt=True
     )
-    for chunk in stream_generate(model, tokenizer, prompt, max_tokens=max_tokens):
+    kw = {}
+    if temp is not None:
+        from mlx_lm.sample_utils import make_sampler
+
+        kw["sampler"] = make_sampler(temp=temp)
+    for chunk in stream_generate(
+        model, tokenizer, prompt, max_tokens=max_tokens, **kw
+    ):
         yield chunk.text
 
 
@@ -64,15 +74,23 @@ def chat(
     model: str | None = None,
     max_tokens: int = 1024,
     backend: str | None = None,
+    tools: list[dict] | None = None,
+    temp: float | None = None,
 ):
-    """Yield response text chunks. Backend: 'mlx' | 'ollama' | auto."""
+    """Yield response text chunks. Backend: 'mlx' | 'ollama' | auto.
+
+    `tools` is an OpenAI-style function-schema list and `temp` a sampling
+    temperature; only the mlx backend honors them.
+    """
     backend = backend or os.environ.get("OE_LLM_BACKEND", "auto")
     model = model or os.environ.get("OE_LLM_MODEL") or (
         _DEFAULT_MLX_MODEL if backend != "ollama" else "qwen2.5-coder:7b"
     )
     if backend in ("auto", "mlx"):
         try:
-            yield from _mlx_chat(messages, model, max_tokens)
+            yield from _mlx_chat(
+                messages, model, max_tokens, tools=tools, temp=temp
+            )
             return
         except ImportError:
             if backend == "mlx":

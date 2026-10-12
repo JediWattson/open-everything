@@ -200,7 +200,7 @@ def agent(
 
     ag = Agent(
         store, GraphStore(), sha, emb,
-        chat=lambda m: llm.chat(m, model=llm_model),
+        chat=lambda m, tools=None, temp=None: llm.chat(m, model=llm_model, tools=tools, temp=temp),
     )
 
     def on_step(i, action, obs):
@@ -241,7 +241,7 @@ def chat(
             raise typer.Exit(1)
         sha, name = bins[0]["binary_sha256"], bins[0]["binary_name"]
     repl(store, GraphStore(), sha, name, model,
-         lambda m: llm.chat(m, model=llm_model))
+         lambda m, tools=None, temp=None: llm.chat(m, model=llm_model, tools=tools, temp=temp))
 
 
 @app.command()
@@ -271,7 +271,7 @@ def lift(
 
         out_dir, symbols = lift_binary(
             store, sha, name,
-            chat=lambda m: llm.chat(m, model=llm_model),
+            chat=lambda m, tools=None, temp=None: llm.chat(m, model=llm_model, tools=tools, temp=temp),
             out_dir=out / name,
             limit=limit,
             on_progress=on_prog,

@@ -134,3 +134,51 @@ def test_ingest_writes_graph(tmp_path, monkeypatch):
     )
     assert n == 3
     assert g.callees(sha, "main") == ["g"]
+
+
+def test_agent_extracts_native_tool_call():
+    from openeverything.agent import _extract_action
+
+    text = 'thinking\n<tool_call>\n{"name": "show", "arguments": {"name": "f"}}\n</tool_call>\nmore'
+    assert _extract_action(text) == {"tool": "show", "args": {"name": "f"}}
+    assert _extract_action('{"tool": "search", "args": {"query": "x"}}')["tool"] == "search"
+
+
+def test_agent_validates_args_and_replays_repeats(tmp_path):
+    from openeverything.agent import Agent
+
+    store = Store(tmp_path / "db")
+    g = GraphStore(tmp_path / "graph.db")
+    calls = []
+
+    def fake_chat(messages, tools=None):
+        calls.append(tools)
+        yield ""
+
+    ag = Agent(store, g, "sha", None, fake_chat, native=False)
+
+    # bad args → legible validation error, not a TypeError string
+    obs = ag._dispatch({"tool": "graph", "args": {"name": "f", "direction": "up"}})
+    assert "invalid args for graph" in obs
+    assert "direction" in obs
+    assert ag._dispatch({"tool": "nope", "args": {}}).startswith("unknown tool")
+
+    # schema-driven tool_schemas for the chat template
+    schemas = ag.tool_schemas()
+    names = {s["function"]["name"] for s in schemas}
+    assert names == {"search", "show", "graph", "functions"}
+    assert "direction" in next(
+        s for s in schemas if s["function"]["name"] == "graph"
+    )["function"]["parameters"]["properties"]
+
+    # loop guard: second identical call replays cached obs, no re-execution
+    ran = []
+
+    class SpyAgent(Agent):
+        def _dispatch(self, action):
+            ran.append(action)
+            return "OBS"
+
+    spy = SpyAgent(store, g, "sha", None, fake_chat, native=False)
+    obs1 = spy._dispatch({"tool": "functions", "args": {}})
+    assert obs1 == "OBS" and len(ran) == 1

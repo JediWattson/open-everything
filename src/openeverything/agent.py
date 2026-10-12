@@ -1,17 +1,25 @@
 """Agent loop: lets a local LLM drive the harness tools to answer RE goals.
 
-The model responds with exactly one JSON action per turn:
-    {"tool": "<name>", "args": {...}}   -> executes, result fed back as OBSERVATION
-    {"answer": "<text>"}                -> terminates the loop
+Two protocols are supported:
 
-Tool results are truncated to keep the context small — `show` bodies are the
-biggest context consumer.
+  * native — tool schemas are passed through the chat template and the model
+    emits <tool_call> blocks (the format it was instruction-tuned on);
+    anything else it emits counts as the answer.
+  * json   — the model must emit one {"tool": ..., "args": ...} or
+    {"answer": ...} object per turn (fallback for templates without tools).
+
+Args are validated against pydantic schemas before dispatch — a ValidationError
+becomes a legible observation the model can self-correct from. Repeat calls
+with identical args replay the cached observation instead of re-executing.
 """
 
 from __future__ import annotations
 
 import json
-from typing import Callable
+import re
+from typing import Callable, Literal
+
+from pydantic import BaseModel, ValidationError
 
 from .graph import GraphStore
 from .store import Store
@@ -19,8 +27,25 @@ from .store import Store
 _MAX_SHOW_CHARS = 3000
 _MAX_LIST = 200
 
-SYSTEM = """You are a reverse-engineering agent analyzing a binary. You answer the
-user's goal by calling tools, one per turn.
+_SYSTEM_BODY = """You are a reverse-engineering agent analyzing a binary. You answer the
+user's questions by calling tools to gather evidence.
+
+Strategy: search for the capability in question, `show` the best hits to
+confirm, use `graph` to understand how they fit together. Cite function names
+and addresses in your answer. Do not guess — gather evidence first."""
+
+SYSTEM_NATIVE = _SYSTEM_BODY + """
+
+To call a tool emit exactly one block and NOTHING else:
+
+<tool_call>
+{"name": "search", "arguments": {"query": "xor cipher"}}
+</tool_call>
+
+You will receive the real tool result in the next message — never write
+tool results yourself. When you have enough evidence, answer in prose."""
+
+SYSTEM_JSON = _SYSTEM_BODY + """
 
 Respond with EXACTLY one JSON object per turn, nothing else:
   {"tool": "<name>", "args": {...}}   to call a tool
@@ -30,15 +55,51 @@ Tools:
   search(query, k=5)        — semantic search over functions; returns name, address, distance
   show(name)                — decompiled body + signature of one function
   graph(name, direction, depth=3) — transitive call graph; direction is "callees" (what it calls) or "callers" (who reaches it)
-  functions()               — list function names in the binary
+  functions()               — list function names in the binary"""
 
-Strategy: search for the capability in question, `show` the best hits to
-confirm, use `graph` to understand how they fit together. Cite function names
-and addresses in your answer. Do not guess — gather evidence first."""
+
+class SearchArgs(BaseModel):
+    query: str
+    k: int = 5
+
+
+class ShowArgs(BaseModel):
+    name: str
+
+
+class GraphArgs(BaseModel):
+    name: str
+    direction: Literal["callees", "callers"] = "callees"
+    depth: int = 3
+
+
+class FunctionsArgs(BaseModel):
+    pass
+
+
+_TOOL_CALL_RE = re.compile(
+    r"<tool_call>\s*(\{.*?\})\s*</tool_call>", re.S
+)
+
+# Small models sometimes simulate the whole loop — narrating fake tool calls
+# AND fake results in prose — instead of emitting a real <tool_call>. Detect
+# and reject rather than treating the fabricated transcript as the answer.
+_FAKE_OBS_RE = re.compile(
+    r"OBSERVATION:|<tool_response|\*\*\w+\s+(Args|Results)\*\*|Step \d+:",
+    re.I,
+)
 
 
 def _extract_action(text: str) -> dict | None:
-    """Find the first balanced JSON object containing 'tool' or 'answer'."""
+    """Native <tool_call> block first, then legacy {"tool"/"answer"} object."""
+    m = _TOOL_CALL_RE.search(text)
+    if m:
+        try:
+            obj = json.loads(m.group(1))
+        except json.JSONDecodeError:
+            obj = None
+        if isinstance(obj, dict) and "name" in obj:
+            return {"tool": obj["name"], "args": obj.get("arguments") or {}}
     dec = json.JSONDecoder()
     for i, ch in enumerate(text):
         if ch != "{":
@@ -47,8 +108,14 @@ def _extract_action(text: str) -> dict | None:
             obj, _ = dec.raw_decode(text[i:])
         except json.JSONDecodeError:
             continue
-        if isinstance(obj, dict) and ("tool" in obj or "answer" in obj):
-            return obj
+        if isinstance(obj, dict):
+            if "tool" in obj or "answer" in obj:
+                return obj
+            if "name" in obj and ("arguments" in obj or "args" in obj):
+                return {
+                    "tool": obj["name"],
+                    "args": obj.get("arguments") or obj.get("args") or {},
+                }
     return None
 
 
@@ -60,13 +127,31 @@ class Agent:
         binary_sha256: str,
         embedder,
         chat: Callable,
+        native: bool = True,
     ):
         self._store = store
         self._graph = graph
         self._sha = binary_sha256
         self._embedder = embedder
         self._chat = chat
-        self.messages = [{"role": "system", "content": SYSTEM}]
+        self._native = native
+        system = SYSTEM_NATIVE if native else SYSTEM_JSON
+        self.messages = [{"role": "system", "content": system}]
+
+    @classmethod
+    def tool_schemas(cls) -> list[dict]:
+        """OpenAI-style function schemas for the chat template's tools arg."""
+        return [
+            {
+                "type": "function",
+                "function": {
+                    "name": name,
+                    "description": desc,
+                    "parameters": model.model_json_schema(),
+                },
+            }
+            for name, (model, desc, _fn) in cls._TOOLS.items()
+        ]
 
     def _tool_search(self, query: str, k: int = 5) -> str:
         vec = self._embedder.embed_query(query)
@@ -115,12 +200,47 @@ class Agent:
         names = [r["name"] for r in rows]
         return json.dumps({"count": len(rows), "names": names})
 
+    # name -> (args schema, description, method)
     _TOOLS = {
-        "search": _tool_search,
-        "show": _tool_show,
-        "graph": _tool_graph,
-        "functions": _tool_functions,
+        "search": (
+            SearchArgs,
+            "semantic search over decompiled functions; returns name, address, distance",
+            _tool_search,
+        ),
+        "show": (
+            ShowArgs,
+            "decompiled body + signature of one function",
+            _tool_show,
+        ),
+        "graph": (
+            GraphArgs,
+            "transitive call graph; direction is 'callees' (what it calls) or 'callers' (who reaches it)",
+            _tool_graph,
+        ),
+        "functions": (
+            FunctionsArgs,
+            "list function names in the binary",
+            _tool_functions,
+        ),
     }
+
+    def _dispatch(self, action: dict) -> str:
+        spec = self._TOOLS.get(action.get("tool", ""))
+        if spec is None:
+            return f"unknown tool {action.get('tool')!r}"
+        model, _desc, method = spec
+        try:
+            args = model.model_validate(action.get("args") or {})
+        except ValidationError as e:
+            errs = "; ".join(
+                f"{'.'.join(str(p) for p in x['loc'])}: {x['msg']}"
+                for x in e.errors()
+            )
+            return f"invalid args for {action['tool']}: {errs}"
+        try:
+            return method(self, **args.model_dump())
+        except Exception as e:
+            return f"error: {e}"
 
     def turn(
         self, user_msg: str, max_iters: int = 12, strict: bool = True,
@@ -128,16 +248,33 @@ class Agent:
     ) -> str:
         """One conversational turn: the model may call tools then answer.
 
-        Appends to self.messages so multi-turn context persists. strict=False
-        treats non-JSON output as a plain-text answer (chat UX).
+        Appends to self.messages so multi-turn context persists. In native
+        mode (or strict=False) non-tool output counts as the answer.
+        Identical repeat calls replay the cached observation.
         """
         self.messages.append({"role": "user", "content": user_msg})
         messages = self.messages
+        seen: dict[tuple, str] = {}
+        tools = self.tool_schemas() if self._native else None
         for i in range(max_iters):
-            raw = "".join(self._chat(messages))
+            raw = "".join(self._chat(messages, tools=tools, temp=0.0))
             action = _extract_action(raw)
             if action is None:
-                if not strict and raw.strip():
+                if self._native and raw.strip() and _FAKE_OBS_RE.search(raw):
+                    messages += [
+                        {"role": "assistant", "content": raw},
+                        {
+                            "role": "user",
+                            "content": "Do not narrate or fabricate tool calls "
+                                       "or their results. Emit a real "
+                                       "<tool_call> block, or answer in "
+                                       "plain prose.",
+                        },
+                    ]
+                    if on_step:
+                        on_step(i, {"fabricated": raw[:160]}, "")
+                    continue
+                if (self._native or not strict) and raw.strip():
                     messages.append({"role": "assistant", "content": raw})
                     return raw
                 messages.append(
@@ -155,14 +292,16 @@ class Agent:
                     {"role": "assistant", "content": json.dumps(action)}
                 )
                 return action["answer"]
-            tool = self._TOOLS.get(action.get("tool", ""))
-            if tool is None:
-                obs = f"unknown tool {action.get('tool')!r}"
+            key = (
+                action.get("tool"),
+                json.dumps(action.get("args") or {}, sort_keys=True),
+            )
+            if key in seen:
+                obs = ("(repeat call — identical result, do not call this "
+                       "tool with these args again): " + seen[key])
             else:
-                try:
-                    obs = tool(self, **action.get("args", {}))
-                except Exception as e:
-                    obs = f"error: {e}"
+                obs = self._dispatch(action)
+                seen[key] = obs
             if on_step:
                 on_step(i, action, obs[:400])
             messages += [
