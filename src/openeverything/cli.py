@@ -360,8 +360,22 @@ def mksft(
     """Generate (decompiled, source) SFT pairs by compiling C sources."""
     from .sft import generate_pairs
 
+    srcs: list[Path] = []
+    for s in sources:
+        s = Path(s)
+        if s.is_dir():
+            for pat in ("*.c", "*.cc", "*.cpp", "*.cxx"):
+                srcs.extend(sorted(s.rglob(pat)))
+        else:
+            srcs.append(s)
+    srcs = sorted(set(srcs))
+    if not srcs:
+        err.print("no C/C++ sources found")
+        raise typer.Exit(1)
+    console.print(f"[dim]{len(srcs)} source files[/]")
+
     stats = generate_pairs(
-        [Path(s) for s in sources], out, tuple(opts.split(",")),
+        srcs, out, tuple(opts.split(",")),
         on_progress=lambda i, n, name: err.print(
             f"[dim]{i}/{n} {name}[/]"),
     )
