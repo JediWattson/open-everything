@@ -215,6 +215,36 @@ def agent(
 
 
 @app.command()
+def chat(
+    binary: str | None = typer.Option(None, "--binary", "-b", help="Target binary (required if >1 indexed)"),
+    model: str | None = typer.Option(None, "--model", "-m"),
+    llm_model: str | None = typer.Option(None, "--llm"),
+):
+    """Interactive chat REPL — the agent drives tools, context persists."""
+    from . import llm
+    from .chat import repl
+    from .graph import GraphStore
+
+    store = Store()
+    if binary:
+        sha, name = _resolve_sha(store, binary), binary
+        for b in store.list_binaries():
+            if b["binary_sha256"] == sha:
+                name = b["binary_name"]
+    else:
+        bins = store.list_binaries()
+        if not bins:
+            err.print("no binaries indexed — run `oe ingest` first")
+            raise typer.Exit(1)
+        if len(bins) != 1:
+            err.print("pass --binary (more than one binary indexed)")
+            raise typer.Exit(1)
+        sha, name = bins[0]["binary_sha256"], bins[0]["binary_name"]
+    repl(store, GraphStore(), sha, name, model,
+         lambda m: llm.chat(m, model=llm_model))
+
+
+@app.command()
 def lift(
     binary: str,
     out: Path = typer.Option(Path("lifted"), "--out", "-o", help="Output root (gets <out>/<binary>/)"),
@@ -251,6 +281,62 @@ def lift(
         f"[green]ok[/] {len(symbols)} functions → {out_dir} "
         f"({failed} fell back to raw decompile)"
     )
+
+
+@app.command()
+def match(
+    a: str,
+    b: str,
+    limit: int = typer.Option(40, "-n"),
+    model: str | None = typer.Option(None, "--model", "-m"),
+):
+    """Align functions across two binaries by embedding similarity."""
+    store = Store()
+    sha_a, sha_b = _resolve_sha(store, a), _resolve_sha(store, b)
+    indexed = store.distinct_models()
+    if model is None and len(indexed) == 1:
+        model = indexed.pop()
+    from .match import match_binaries
+
+    rows = match_binaries(store, sha_a, sha_b, model or "")
+    table = Table(a, "→", b, "sim", "verdict", title=f"{a} × {b}")
+    for r in rows[:limit]:
+        color = {"same": "green", "similar": "yellow", "novel": "red"}[r["verdict"]]
+        table.add_row(r["a_name"], "→", r["b_name"], f"{r['sim']:.3f}",
+                      f"[{color}]{r['verdict']}[/]")
+    console.print(table)
+    counts = {}
+    for r in rows:
+        counts[r["verdict"]] = counts.get(r["verdict"], 0) + 1
+    console.print(counts)
+
+
+@app.command()
+def splice(
+    target: str,
+    donor: str = typer.Option(..., "--from", "-f", help="Donor binary"),
+    seeds: list[str] = typer.Option(..., "--seed", "-s", help="Donor seed function(s)"),
+    out: Path = typer.Option(Path("spliced"), "--out", "-o"),
+):
+    """Graft donor function(s) + their callee closure into a target binary."""
+    from .graph import GraphStore
+    from .splice import splice as do_splice
+
+    store = Store()
+    t_sha = _resolve_sha(store, target)
+    d_sha = _resolve_sha(store, donor)
+    names = {b["binary_sha256"]: b["binary_name"] for b in store.list_binaries()}
+    report = do_splice(
+        store, GraphStore(), t_sha, names[t_sha], d_sha, names[d_sha],
+        seeds, out / f"{names[t_sha]}+{names[d_sha]}",
+    )
+    console.print(
+        f"[green]ok[/] slice of {report['slice_size']} functions → "
+        f"{out}/{names[t_sha]}+{names[d_sha]} "
+        f"({sum(len(v) for v in report['unresolved_refs'].values())} unresolved refs)"
+    )
+    if report["missing_seeds"]:
+        err.print(f"seeds with no bodies: {report['missing_seeds']}")
 
 
 @app.command()

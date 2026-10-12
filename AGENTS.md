@@ -37,6 +37,9 @@ and stored in LanceDB for semantic search ("RAG over a binary").
 ./setup.sh --check    # verify only, install nothing
 ```
 
+setup.sh also symlinks `oe` into `~/.local/bin` (`OE_BIN_DIR` to override),
+so it runs from any directory. `make global` re-creates just the symlink.
+
 which wraps (manual equivalent):
 
 ```sh
@@ -80,7 +83,11 @@ oe show <func> -b <binary>          # print pseudocode
 oe graph <func> -b <binary> [-d N] [--callers]   # transitive call graph
 oe ask "<question>" [-b bin] [-k N] [--llm M] [--context-only]  # RAG → local LLM
 oe agent "<goal>" [-b bin] [--iters N] [-q]     # agentic tool-use loop
+oe chat [-b bin]                    # interactive REPL — persistent agent session
+                                    #   /bin /binaries /search /show /graph /funcs /clear /quit
 oe lift <binary> [-o dir] [-n N] [--llm M]      # whole-binary → lifted/*.cpp
+oe match <a> <b> [-n N]             # cross-binary function alignment (cosine sim)
+oe splice <target> --from <donor> --seed <fn>...   # graft donor subsystem into target
 oe functions <binary>               # list functions
 oe binaries                         # list indexed binaries
 oe rm <binary>                      # drop from index

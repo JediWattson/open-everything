@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # setup.sh — one-shot environment setup for open-everything.
 #
-#   ./setup.sh              full setup: venv, pip deps, JDK, Ghidra
+#   ./setup.sh              full setup: venv, pip deps, JDK, Ghidra, global `oe`
 #   ./setup.sh --check      verify the environment, install nothing
 #   ./setup.sh --with-model also pre-download the embedding model (~3 GB)
 #
@@ -205,6 +205,31 @@ if [ "$WITH_MODEL" = 1 ] && [ "$CHECK_ONLY" = 0 ] && [ -x "$VENV/bin/python" ]; 
   say "embedding model (first download is ~3 GB)"
   "$VENV/bin/python" -c 'from openeverything.embed import Embedder; Embedder()' \
     && ok "model cached" || need "model download failed"
+fi
+
+# --- global `oe` on PATH -------------------------------------------------------
+say "global 'oe'"
+# Symlink into a user bin dir — the venv entry point's shebang makes it
+# work from anywhere, and `pip install -e` keeps it live with code changes.
+OE_BIN_DIR="${OE_BIN_DIR:-$HOME/.local/bin}"
+if [ -x "$VENV/bin/oe" ]; then
+  if [ "$CHECK_ONLY" = 1 ]; then
+    if [ -x "$OE_BIN_DIR/oe" ]; then
+      ok "$OE_BIN_DIR/oe"
+    elif have oe; then
+      ok "oe on PATH: $(command -v oe)"
+    else
+      need "oe not on PATH (re-run ./setup.sh or symlink $VENV/bin/oe into ~/.local/bin)"
+    fi
+  else
+    mkdir -p "$OE_BIN_DIR"
+    ln -sf "$PWD/$VENV/bin/oe" "$OE_BIN_DIR/oe"
+    ok "oe -> $OE_BIN_DIR/oe"
+    case ":$PATH:" in
+      *":$OE_BIN_DIR:"*) ;;
+      *) warn "$OE_BIN_DIR is not on PATH — add it to your shell profile" ;;
+    esac
+  fi
 fi
 
 # --- report -------------------------------------------------------------------

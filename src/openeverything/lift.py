@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from pathlib import Path
 
 from .store import Store
@@ -24,6 +25,8 @@ functions it calls. Respond with EXACTLY one JSON object, nothing else:
 
 Rules:
 - Call callees by their NEW names from the signatures given.
+- NEVER invent callee names — anything without a given signature keeps its
+  original FUN_*/DAT_* token verbatim.
 - Keep the logic identical; only rename, retype, and restructure for clarity.
 - `code` must be a complete function definition (with braces)."""
 
@@ -50,6 +53,15 @@ def topo_order(rows: list[dict]) -> list[dict]:
             for c in by_name[name].get("callees", []):
                 stack.append((c, False))
     return [by_name[n] for n in order]
+
+
+_INTRINSICS = {
+    "if", "for", "while", "switch", "return", "sizeof", "do", "else",
+    "CONCAT44", "CONCAT22", "SUB41", "SUB81", "ZEXT14", "ZEXT24", "ZEXT48",
+    "SEXT14", "SEXT24", "SEXT48", "SBORROW4", "SBORROW8", "CARRY4", "CARRY8",
+    "halt_baddata", "undefined", "byte", "uint", "ulong", "ushort", "char",
+    "int", "long", "void", "bool", "float", "double",
+}
 
 
 def _body_hash(body: str) -> str:
@@ -117,19 +129,57 @@ def lift_binary(
         order = order[:limit]
 
     symbols: dict[str, dict] = {}
+    used_names: set[str] = set()
     for i, rec in enumerate(order):
         if on_progress:
             on_progress(i + 1, len(order), rec["name"])
         raw = "".join(chat(_lift_prompt(rec, symbols)))
         res = _extract_json(raw) or {}
+        new_name = res.get("name") or rec["name"]
+        signature = res.get("signature") or rec["signature"]
+        code = res.get("code") or rec["decompiled"]
+        if new_name in used_names:
+            n = 2
+            while f"{new_name}_{n}" in used_names:
+                n += 1
+            renamed = f"{new_name}_{n}"
+            signature = signature.replace(new_name, renamed, 1)
+            code = re.sub(rf"\b{re.escape(new_name)}\b", renamed, code)
+            new_name = renamed
+        used_names.add(new_name)
         symbols[rec["name"]] = {
-            "name": res.get("name") or rec["name"],
-            "signature": res.get("signature") or rec["signature"],
+            "name": new_name,
+            "signature": signature,
             "doc": res.get("doc") or "",
-            "code": res.get("code") or rec["decompiled"],
+            "code": code,
             "address": rec["address"],
             "failed": "code" not in res,
         }
+
+    # Post-pass: rewrite every lifted original name anywhere it appears in
+    # emitted code — covers LLM non-compliance and non-callee references
+    # (function pointers, thunks) the per-function prompt can't see.
+    renames = {
+        orig: s["name"] for orig, s in symbols.items() if s["name"] != orig
+    }
+    for fn in order:
+        code = symbols[fn["name"]]["code"]
+        for orig, new in renames.items():
+            if orig != fn["name"] and orig in code:
+                code = re.sub(rf"\b{re.escape(orig)}\b", new, code)
+        symbols[fn["name"]]["code"] = code
+
+    # Unresolved call sites: names called in code that have no lifted symbol
+    # or decl — mostly LLM-invented names; recorded as a quality metric.
+    known = {s["name"] for s in symbols.values()}
+    known |= {c for r in uniq for c in r["callees"]}
+    # Ghidra Mach-O names keep the '_' prefix — LLM output uses the C name
+    known |= {n.lstrip("_") for n in known}
+    known |= set(_INTRINSICS)
+    for fn in order:
+        s = symbols[fn["name"]]
+        called = set(re.findall(r"\b([a-zA-Z_]\w*)\s*\(", s["code"]))
+        s["unresolved"] = sorted(called - known - {s["name"]})
 
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -139,6 +189,17 @@ def lift_binary(
         s = symbols[fn["name"]]
         sig = s["signature"].rstrip(";")
         decls.append(f"{sig};  // {s['doc']}" if s["doc"] else f"{sig};")
+    # Declarations for referenced-but-unlifted functions (externals, thunks,
+    # body-less FUN_*) so lifted.cpp is self-contained.
+    all_rows = {r["name"]: r for r in store.list_functions(sha256, limit=100000)}
+    unlifted = sorted(
+        {c for r in uniq for c in r["callees"] if c not in symbols}
+    )
+    if unlifted:
+        decls += ["", "// unlifted/external functions:"]
+        for name in unlifted:
+            sig = all_rows.get(name, {}).get("signature") or f"void {name}(void)"
+            decls.append(f"{sig.rstrip(';')};")
     if aliases:
         decls += ["", "// unresolved originals:"]
         for fun, alias in aliases.items():
@@ -161,9 +222,13 @@ def lift_binary(
         body.append("")
     (out_dir / "lifted.cpp").write_text("\n".join(body))
 
+    n_unresolved = sum(len(s["unresolved"]) for s in symbols.values())
     report = {
         "binary": binary_name,
         "sha256": sha256,
+        "n_functions": len(symbols),
+        "n_failed": sum(1 for s in symbols.values() if s["failed"]),
+        "n_unresolved_calls": n_unresolved,
         "functions": {
             orig: {k: v for k, v in s.items() if k != "code"}
             for orig, s in symbols.items()

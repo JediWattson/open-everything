@@ -18,6 +18,11 @@ setup-model: ## setup + pre-download the embedding model (~3 GB)
 check: ## Verify the environment without installing anything
 	./setup.sh --check
 
+global: ## Symlink oe into ~/.local/bin so it runs from anywhere
+	mkdir -p ~/.local/bin
+	ln -sf $(abspath $(OE)) ~/.local/bin/oe
+	@echo "oe -> ~/.local/bin/oe"
+
 test: ## Unit tests (no Ghidra or model needed)
 	$(PY) -m pytest tests/ -q
 

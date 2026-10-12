@@ -66,6 +66,7 @@ class Agent:
         self._sha = binary_sha256
         self._embedder = embedder
         self._chat = chat
+        self.messages = [{"role": "system", "content": SYSTEM}]
 
     def _tool_search(self, query: str, k: int = 5) -> str:
         vec = self._embedder.embed_query(query)
@@ -121,16 +122,24 @@ class Agent:
         "functions": _tool_functions,
     }
 
-    def run(self, goal: str, max_iters: int = 12, on_step=None) -> str:
-        """Run the agent loop. on_step(i, action, observation) per iteration."""
-        messages = [
-            {"role": "system", "content": SYSTEM},
-            {"role": "user", "content": f"Goal: {goal}"},
-        ]
+    def turn(
+        self, user_msg: str, max_iters: int = 12, strict: bool = True,
+        on_step=None,
+    ) -> str:
+        """One conversational turn: the model may call tools then answer.
+
+        Appends to self.messages so multi-turn context persists. strict=False
+        treats non-JSON output as a plain-text answer (chat UX).
+        """
+        self.messages.append({"role": "user", "content": user_msg})
+        messages = self.messages
         for i in range(max_iters):
             raw = "".join(self._chat(messages))
             action = _extract_action(raw)
             if action is None:
+                if not strict and raw.strip():
+                    messages.append({"role": "assistant", "content": raw})
+                    return raw
                 messages.append(
                     {
                         "role": "user",
@@ -142,6 +151,9 @@ class Agent:
                     on_step(i, {"parse_error": raw[:200]}, "")
                 continue
             if "answer" in action:
+                messages.append(
+                    {"role": "assistant", "content": json.dumps(action)}
+                )
                 return action["answer"]
             tool = self._TOOLS.get(action.get("tool", ""))
             if tool is None:
@@ -158,3 +170,8 @@ class Agent:
                 {"role": "user", "content": f"OBSERVATION: {obs}"},
             ]
         return "(reached iteration limit without an answer)"
+
+    def run(self, goal: str, max_iters: int = 12, on_step=None) -> str:
+        """Single-shot agent run (back-compat wrapper around turn())."""
+        return self.turn(f"Goal: {goal}", max_iters, strict=True,
+                         on_step=on_step)
