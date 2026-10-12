@@ -50,6 +50,63 @@ def _mlx_chat(
         yield chunk.text
 
 
+def _api_chat(
+    messages: list[dict], model_name: str, max_tokens: int,
+    tools: list[dict] | None = None, temp: float | None = None,
+):
+    """OpenAI-compatible /v1/chat/completions (LM Studio, llama.cpp,
+    OpenRouter, OpenAI, …). Base+key from OE_API_BASE / OE_API_KEY.
+
+    Tool calls come back as tool_calls deltas; re-emitted as our internal
+    <tool_call> text so the agent parser is backend-agnostic."""
+    base = os.environ.get("OE_API_BASE", "http://localhost:1234")
+    key = os.environ.get("OE_API_KEY", "none")
+    body: dict = {
+        "model": model_name,
+        "messages": messages,
+        "stream": True,
+        "max_tokens": max_tokens,
+    }
+    if tools:
+        body["tools"] = tools
+    if temp is not None:
+        body["temperature"] = temp
+    body = json.dumps(body).encode()
+    req = urllib.request.Request(
+        f"{base.rstrip('/')}/v1/chat/completions",
+        body,
+        {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {key}",
+        },
+    )
+    pending_calls: dict[int, dict] = {}
+    with urllib.request.urlopen(req) as resp:
+        for line in resp:
+            if not line.startswith(b"data: "):
+                continue
+            data = line[6:].strip()
+            if data == b"[DONE]":
+                break
+            chunk = json.loads(data)
+            delta = chunk["choices"][0].get("delta", {})
+            for tc in delta.get("tool_calls") or []:
+                slot = pending_calls.setdefault(
+                    tc["index"], {"name": "", "arguments": ""}
+                )
+                fn = tc.get("function") or {}
+                slot["name"] += fn.get("name") or ""
+                slot["arguments"] += fn.get("arguments") or ""
+            if text := delta.get("content"):
+                yield text
+    for tc in pending_calls.values():
+        yield (
+            "<tool_call>\n"
+            + json.dumps({"name": tc["name"], "arguments": json.loads(tc["arguments"] or "{}")})
+            + "\n</tool_call>"
+        )
+
+
 def _ollama_chat(messages: list[dict], model_name: str, max_tokens: int):
     body = json.dumps(
         {
@@ -83,9 +140,10 @@ def chat(
     temperature; only the mlx backend honors them.
     """
     backend = backend or os.environ.get("OE_LLM_BACKEND", "auto")
-    model = model or os.environ.get("OE_LLM_MODEL") or (
-        _DEFAULT_MLX_MODEL if backend != "ollama" else "qwen2.5-coder:7b"
-    )
+    model = model or os.environ.get("OE_LLM_MODEL") or {
+        "ollama": "qwen2.5-coder:7b",
+        "api": "local-model",
+    }.get(backend, _DEFAULT_MLX_MODEL)
     if backend in ("auto", "mlx"):
         try:
             yield from _mlx_chat(
@@ -98,6 +156,12 @@ def chat(
     if backend in ("auto", "ollama") and _ollama_reachable():
         yield from _ollama_chat(messages, model, max_tokens)
         return
+    if backend == "api":
+        yield from _api_chat(
+            messages, model, max_tokens, tools=tools, temp=temp
+        )
+        return
     raise RuntimeError(
-        "no local LLM backend — `pip install mlx-lm` or run `ollama serve`"
+        "no local LLM backend — `pip install mlx-lm`, run `ollama serve`, "
+        "or set OE_LLM_BACKEND=api + OE_API_BASE/OE_API_KEY"
     )

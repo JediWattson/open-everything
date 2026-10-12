@@ -15,9 +15,13 @@ and stored in LanceDB for semantic search ("RAG over a binary").
 - `src/openeverything/graph.py` — SQLite `edges` table (name-keyed
   caller→callee per binary) for multi-hop call-graph traversal via
   recursive CTEs. Derived index — rebuilt from `callees` on ingest.
-- `src/openeverything/llm.py` — local LLM backend for `oe ask`: in-process
-  mlx-lm on Metal, or a running Ollama server (`OE_LLM_BACKEND`,
-  `OE_LLM_MODEL`).
+- `src/openeverything/llm.py` — LLM backends for `oe ask`/`agent`/`chat`/
+  `lift`: in-process mlx-lm on Metal (default), a running Ollama server,
+  or any OpenAI-compatible endpoint (`OE_LLM_BACKEND=api` +
+  `OE_API_BASE`/`OE_API_KEY` — works with LM Studio, llama.cpp,
+  OpenRouter, …; `tools`/`temperature` forwarded, `tool_calls` deltas
+  translated back to internal `<tool_call>` text). `OE_LLM_MODEL` picks
+  the model; 14B-4bit is the practical ceiling on 16 GB.
 - `src/openeverything/agent.py` — agent loop for `oe agent`: the LLM emits one
   JSON action per turn (`{"tool": ..., "args": ...}` / `{"answer": ...}`) and
   can call search/show/graph/functions; observations are fed back truncated.
