@@ -352,6 +352,29 @@ def splice(
 
 
 @app.command()
+def mksft(
+    sources: list[Path],
+    out: Path = typer.Option(Path("sft/lift-pairs.jsonl"), "--out", "-o"),
+    opts: str = typer.Option("O0,O1,O2,Os", "--opts", help="Optimization levels"),
+):
+    """Generate (decompiled, source) SFT pairs by compiling C sources."""
+    from .sft import generate_pairs
+
+    stats = generate_pairs(
+        [Path(s) for s in sources], out, tuple(opts.split(",")),
+        on_progress=lambda i, n, name: err.print(
+            f"[dim]{i}/{n} {name}[/]"),
+    )
+    console.print(
+        f"[green]ok[/] {stats['pairs']} pairs → {out} "
+        f"({stats['binaries']} binaries from {stats['files']} files)"
+    )
+    for k, names in stats["unmatched"].items():
+        if names:
+            err.print(f"  unmatched in {k}: {names}")
+
+
+@app.command()
 def binaries():
     """List indexed binaries."""
     rows = Store().list_binaries()
