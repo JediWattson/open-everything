@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
 
@@ -386,6 +387,58 @@ def mksft(
     for k, names in stats["unmatched"].items():
         if names:
             err.print(f"  unmatched in {k}: {names}")
+
+
+@app.command()
+def clusters(
+    binary: str,
+    threshold: float = typer.Option(0.35, "-t", help="Cosine-distance merge threshold"),
+    label: bool = typer.Option(False, "--label", help="LLM-label each cluster"),
+    llm_model: str | None = typer.Option(None, "--llm"),
+    model: str | None = typer.Option(None, "--model", "-m"),
+    out: Path | None = typer.Option(None, "--out", "-o", help="Write cluster map JSON"),
+):
+    """Group a binary's functions into subsystem clusters (embedding-based)."""
+    from .cluster import cluster_functions, label_clusters, load_rows
+
+    store = Store()
+    sha = _resolve_sha(store, binary)
+    indexed = store.distinct_models()
+    if model is None and len(indexed) == 1:
+        model = indexed.pop()
+    rows = load_rows(store, sha, model or "")
+    groups = cluster_functions(rows, threshold)
+
+    labels = [""] * len(groups)
+    if label:
+        from . import llm
+
+        labels = label_clusters(
+            groups,
+            lambda m, tools=None, temp=None: llm.chat(
+                m, model=llm_model, tools=tools, temp=temp),
+            binary,
+        )
+
+    table = Table("cluster", "size", "members", title=f"{binary} subsystems")
+    for i, members in enumerate(groups):
+        names = ", ".join(m["name"] for m in members[:8])
+        if len(members) > 8:
+            names += f", +{len(members) - 8} more"
+        table.add_row(
+            f"{i}: {labels[i]}" if labels[i] else str(i),
+            str(len(members)), names,
+        )
+    console.print(table)
+
+    if out:
+        data = [
+            {"id": i, "label": labels[i] or None,
+             "members": [m["name"] for m in members]}
+            for i, members in enumerate(groups)
+        ]
+        Path(out).write_text(json.dumps(data, indent=2))
+        console.print(f"[dim]wrote {out}[/]")
 
 
 @app.command()

@@ -100,6 +100,8 @@ oe chat [-b bin]                    # interactive REPL — persistent agent sess
                                     #   /bin /binaries /search /show /graph /funcs /clear /quit
 oe lift <binary> [-o dir] [-n N] [--llm M]      # whole-binary → lifted/*.cpp
 oe match <a> <b> [-n N]             # cross-binary function alignment (cosine sim)
+oe clusters <bin> [-t 0.25] [--label] [--out map.json]
+                                    # subsystem clustering on embeddings
 oe splice <target> --from <donor> --seed <fn>...   # graft donor subsystem into target
 oe mksft <src.c>... [-o sft/pairs.jsonl] [--opts O0,O1,O2,Os]
                                     # SFT pair gen: compile→decompile→align
