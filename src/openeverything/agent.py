@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import json
 import re
+from pathlib import Path
 from typing import Callable, Literal
 
 from pydantic import BaseModel, ValidationError
@@ -128,6 +129,7 @@ class Agent:
         embedder,
         chat: Callable,
         native: bool = True,
+        log_path=None,
     ):
         self._store = store
         self._graph = graph
@@ -135,8 +137,25 @@ class Agent:
         self._embedder = embedder
         self._chat = chat
         self._native = native
+        self._log = Path(log_path) if log_path else None
         system = SYSTEM_NATIVE if native else SYSTEM_JSON
         self.messages = [{"role": "system", "content": system}]
+
+    def _write_log(self, user_msg: str, answer: str):
+        if not self._log:
+            return
+        self._log.parent.mkdir(parents=True, exist_ok=True)
+        with self._log.open("a") as f:
+            f.write(
+                json.dumps(
+                    {
+                        "user": user_msg,
+                        "answer": answer,
+                        "messages": self.messages,
+                    }
+                )
+                + "\n"
+            )
 
     @classmethod
     def tool_schemas(cls) -> list[dict]:
@@ -276,6 +295,7 @@ class Agent:
                     continue
                 if (self._native or not strict) and raw.strip():
                     messages.append({"role": "assistant", "content": raw})
+                    self._write_log(user_msg, raw)
                     return raw
                 messages.append(
                     {
@@ -291,6 +311,7 @@ class Agent:
                 messages.append(
                     {"role": "assistant", "content": json.dumps(action)}
                 )
+                self._write_log(user_msg, action["answer"])
                 return action["answer"]
             key = (
                 action.get("tool"),
@@ -308,7 +329,9 @@ class Agent:
                 {"role": "assistant", "content": json.dumps(action)},
                 {"role": "user", "content": f"OBSERVATION: {obs}"},
             ]
-        return "(reached iteration limit without an answer)"
+        answer = "(reached iteration limit without an answer)"
+        self._write_log(user_msg, answer)
+        return answer
 
     def run(self, goal: str, max_iters: int = 12, on_step=None) -> str:
         """Single-shot agent run (back-compat wrapper around turn())."""

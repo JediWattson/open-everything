@@ -25,6 +25,14 @@ def _embedder(model: str | None = None):
     return Embedder(model)
 
 
+def _run_log(kind: str) -> Path:
+    import time
+
+    p = Path("runs")
+    p.mkdir(exist_ok=True)
+    return p / f"{kind}-{int(time.time())}.jsonl"
+
+
 def _resolve_sha(store: Store, binary: str) -> str:
     """Accept a sha256 prefix or a binary name."""
     for b in store.list_binaries():
@@ -178,6 +186,7 @@ def agent(
     model: str | None = typer.Option(None, "--model", "-m"),
     llm_model: str | None = typer.Option(None, "--llm"),
     quiet: bool = typer.Option(False, "--quiet", "-q", help="Hide step trace"),
+    log: bool = typer.Option(False, "--log", help="Append JSONL trajectory to runs/agent-<ts>.jsonl"),
 ):
     """Let a local LLM drive search/show/graph tools to answer a goal."""
     from . import llm
@@ -201,6 +210,7 @@ def agent(
     ag = Agent(
         store, GraphStore(), sha, emb,
         chat=lambda m, tools=None, temp=None: llm.chat(m, model=llm_model, tools=tools, temp=temp),
+        log_path=_run_log("agent") if log else None,
     )
 
     def on_step(i, action, obs):
@@ -219,6 +229,7 @@ def chat(
     binary: str | None = typer.Option(None, "--binary", "-b", help="Target binary (required if >1 indexed)"),
     model: str | None = typer.Option(None, "--model", "-m"),
     llm_model: str | None = typer.Option(None, "--llm"),
+    log: bool = typer.Option(False, "--log", help="Append JSONL trajectory to runs/chat-<ts>.jsonl"),
 ):
     """Interactive chat REPL — the agent drives tools, context persists."""
     from . import llm
@@ -241,7 +252,8 @@ def chat(
             raise typer.Exit(1)
         sha, name = bins[0]["binary_sha256"], bins[0]["binary_name"]
     repl(store, GraphStore(), sha, name, model,
-         lambda m, tools=None, temp=None: llm.chat(m, model=llm_model, tools=tools, temp=temp))
+         lambda m, tools=None, temp=None: llm.chat(m, model=llm_model, tools=tools, temp=temp),
+         log_path=_run_log("chat") if log else None)
 
 
 @app.command()

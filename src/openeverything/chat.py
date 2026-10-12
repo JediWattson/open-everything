@@ -132,10 +132,13 @@ def repl(
     binary_name: str,
     embedder_model: str | None,
     llm_chat,
+    log_path=None,
 ) -> None:
     global _lazy
     _lazy = _LazyEmbedder(embedder_model)
-    agent = Agent(store, graph, sha, _lazy, llm_chat)
+    agent = Agent(store, graph, sha, _lazy, llm_chat, log_path=log_path)
+    if log_path:
+        console.print(f"[dim]logging turns to {log_path}[/]")
     console.print(
         f"[bold]oe chat[/] — binary [cyan]{binary_name}[/]. "
         "Type /help for commands, /quit to exit."

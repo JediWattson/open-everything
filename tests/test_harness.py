@@ -182,3 +182,24 @@ def test_agent_validates_args_and_replays_repeats(tmp_path):
     spy = SpyAgent(store, g, "sha", None, fake_chat, native=False)
     obs1 = spy._dispatch({"tool": "functions", "args": {}})
     assert obs1 == "OBS" and len(ran) == 1
+
+
+def test_agent_logs_trajectory(tmp_path):
+    import json as _json
+
+    from openeverything.agent import Agent
+
+    store = Store(tmp_path / "db")
+    g = GraphStore(tmp_path / "graph.db")
+
+    def fake_chat(messages, tools=None, temp=None):
+        yield '{"answer": "done"}'
+
+    log = tmp_path / "runs" / "t.jsonl"
+    ag = Agent(store, g, "sha", None, fake_chat, native=False, log_path=log)
+    assert ag.turn("hi") == "done"
+    rec = _json.loads(log.read_text().strip())
+    assert rec["user"] == "hi" and rec["answer"] == "done"
+    assert rec["messages"][0]["role"] == "system"
+    assert rec["messages"][-1] == {"role": "assistant",
+                                   "content": '{"answer": "done"}'}

@@ -27,6 +27,9 @@ and stored in LanceDB for semantic search ("RAG over a binary").
   are rejected. Native `<tool_call>` format via chat-template `tools=` is the
   default (`native=True`); legacy `{"tool": ...}` JSON parsing remains as a
   fallback path. `llm.chat(..., temp=0)` for deterministic tool emission.
+  `--log` on `oe agent`/`oe chat` appends JSONL turn records
+  (`runs/<kind>-<ts>.jsonl`) — full message history per turn, ready to curate
+  into a LoRA SFT dataset (mlx_lm.lora chat format).
 - `src/openeverything/lift.py` — whole-binary lift for `oe lift`: visits
   functions callee-first (call-graph post-order), rewrites each via the LLM
   into a named/typed/documented function, and threads a shared symbol table
