@@ -53,6 +53,17 @@ def graph_communities(
     neighbors = {
         r["name"]: set(r["callees"]) | set(r["callers"]) for r in rows
     }
+    # hub filter: a neighbor shared by too many functions is glue noise
+    # (_printf, _malloc, the entry dispatcher) — drop it from every set so
+    # it can't merge communities. Small fan-ins (_strcoll, _fts_read) keep
+    # their semantic signal.
+    fan_in: dict[str, int] = {}
+    for s in neighbors.values():
+        for n in s:
+            fan_in[n] = fan_in.get(n, 0) + 1
+    cap = max(8, len(rows) // 4)
+    hubs = {n for n, k in fan_in.items() if k > cap}
+    neighbors = {n: s - hubs for n, s in neighbors.items()}
     direct = {
         r["name"]: {
             c for c in r["callees"] if c in in_bin
@@ -101,6 +112,49 @@ def load_rows(store: Store, sha: str, model: str) -> list[dict]:
     return [r for r in rows if r["decompiled"]]
 
 
+def _row_text(r: dict) -> str:
+    from .embed import build_embed_text
+    from .models import FunctionRecord
+
+    return build_embed_text(FunctionRecord(**{
+        k: r[k] for k in (
+            "binary_sha256", "binary_name", "address", "name",
+            "signature", "decompiled", "callees", "callers",
+            "strings", "is_external", "is_thunk", "size",
+        )
+    }))
+
+
+def _neighbor_scores(rows: list[dict]) -> dict[str, dict[str, int]]:
+    """anchor -> {other: relatedness} — 2 per shared neighbor + 3 direct."""
+    names = [r["name"] for r in rows]
+    in_bin = set(names)
+    neighbors = {
+        r["name"]: set(r["callees"]) | set(r["callers"]) for r in rows
+    }
+    direct = {
+        r["name"]: {
+            c for c in r["callees"] if c in in_bin
+        } | {
+            c for c in r["callers"] if c in in_bin
+        }
+        for r in rows
+    }
+    out: dict[str, dict[str, int]] = {}
+    for n in names:
+        sc: dict[str, int] = {}
+        for other in names:
+            if other == n:
+                continue
+            w = 2 * len(neighbors[n] & neighbors[other]) + (
+                3 if other in direct[n] else 0
+            )
+            if w:
+                sc[other] = w
+        out[n] = sc
+    return out
+
+
 def community_pairs(
     groups: list[list[dict]],
     max_pos: int = 4,
@@ -108,18 +162,6 @@ def community_pairs(
     """Emit contrastive triplets from communities: anchor = a member's embed
     text, positive = another same-community member's, negative = a member of
     a different community. sentence-transformers (TripletLoss / MNRL) shape."""
-    from .embed import build_embed_text
-    from .models import FunctionRecord
-
-    def text(r: dict) -> str:
-        return build_embed_text(FunctionRecord(**{
-            k: r[k] for k in (
-                "binary_sha256", "binary_name", "address", "name",
-                "signature", "decompiled", "callees", "callers",
-                "strings", "is_external", "is_thunk", "size",
-            )
-        }))
-
     pairs = []
     multi = [g for g in groups if len(g) >= 2]
     for gi, g in enumerate(multi):
@@ -129,10 +171,36 @@ def community_pairs(
                 if not negs:
                     continue
                 pairs.append({
-                    "anchor": text(a),
-                    "positive": text(p),
-                    "negative": text(negs[(a_i + gi) % len(negs)]),
+                    "anchor": _row_text(a),
+                    "positive": _row_text(p),
+                    "negative": _row_text(negs[(a_i + gi) % len(negs)]),
                 })
+    return pairs
+
+
+def neighbor_pairs(rows: list[dict], max_pos: int = 4) -> list[dict]:
+    """Contrastive triplets from local call-graph neighborhoods — works even
+    when global communities collapse: positives = top-scored neighbors,
+    negatives = unrelated functions."""
+    scores = _neighbor_scores(rows)
+    by_name = {r["name"]: r for r in rows}
+    pairs = []
+    for r in rows:
+        sc = scores[r["name"]]
+        ranked = sorted(sc, key=lambda n: -sc[n])[:max_pos]
+        unrelated = [
+            m for m in by_name if m != r["name"] and m not in sc
+        ]
+        for pi, p in enumerate(ranked):
+            if not unrelated:
+                break
+            pairs.append({
+                "anchor": _row_text(r),
+                "positive": _row_text(by_name[p]),
+                "negative": _row_text(
+                    by_name[unrelated[(pi + len(r["name"])) % len(unrelated)]]
+                ),
+            })
     return pairs
 
 

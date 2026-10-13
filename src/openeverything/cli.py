@@ -462,8 +462,8 @@ def mkemb(
     out: Path = typer.Option(Path("emb/pairs.jsonl"), "--out", "-o"),
     max_pos: int = typer.Option(4, "--max-pos", help="Positives per anchor"),
 ):
-    """Emit contrastive triplets from call-graph communities (embedder SFT)."""
-    from .cluster import community_pairs, graph_communities, load_rows
+    """Emit contrastive triplets from call-graph neighborhoods (embedder SFT)."""
+    from .cluster import neighbor_pairs, load_rows
 
     store = Store()
     indexed = store.distinct_models()
@@ -474,15 +474,44 @@ def mkemb(
         for b in binaries:
             sha = _resolve_sha(store, b)
             rows = load_rows(store, sha, model)
-            groups = graph_communities(rows)
-            pairs = community_pairs(groups, max_pos=max_pos)
+            pairs = neighbor_pairs(rows, max_pos=max_pos)
             for p in pairs:
                 f.write(json.dumps(p) + "\n")
             total += len(pairs)
-            console.print(
-                f"[dim]{b}: {len(groups)} communities → {len(pairs)} triplets[/]"
-            )
+            console.print(f"[dim]{b}: {len(pairs)} triplets[/]")
     console.print(f"[green]ok[/] {total} triplets → {out}")
+
+
+@app.command()
+def trainemb(
+    pairs: list[Path],
+    out: Path = typer.Option(Path("emb/qodo-lora"), "--out", "-o"),
+    epochs: int = typer.Option(1, "--epochs"),
+    batch: int = typer.Option(1, "--batch", help="Triplets per step"),
+    lr: float = typer.Option(2e-5, "--lr"),
+    model: str | None = typer.Option(None, "--model", "-m"),
+    eval_binary: str | None = typer.Option(None, "--eval", help="Cluster-ARI eval vs graph communities on this binary"),
+    threshold: float = typer.Option(0.25, "-t"),
+):
+    """LoRA-tune the embedder on {anchor,positive,negative} triplets."""
+    from .embed_train import eval_clusters, train
+    from .cluster import load_rows
+
+    model_name = model or config.DEFAULT_EMBED_MODEL
+    out_dir = train(
+        list(pairs), out, model_name, epochs=epochs,
+        batch_size=batch, lr=lr,
+        on_progress=lambda s, n, l: err.print(
+            f"[dim]{s}/{n} loss={l:.3f}[/]", highlight=False)
+        if s % 10 == 0 or s == n else None,
+    )
+    console.print(f"[green]ok[/] adapter → {out_dir}")
+    if eval_binary:
+        store = Store()
+        sha = _resolve_sha(store, eval_binary)
+        rows = load_rows(store, sha, model_name)
+        res = eval_clusters(out_dir, rows, threshold=threshold)
+        console.print(res)
 
 
 @app.command()
