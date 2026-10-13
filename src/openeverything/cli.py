@@ -404,9 +404,12 @@ def clusters(
     llm_model: str | None = typer.Option(None, "--llm"),
     model: str | None = typer.Option(None, "--model", "-m"),
     out: Path | None = typer.Option(None, "--out", "-o", help="Write cluster map JSON"),
+    graph: bool = typer.Option(False, "--graph", help="Call-graph communities instead of embedding clusters"),
 ):
     """Group a binary's functions into subsystem clusters (embedding-based)."""
-    from .cluster import cluster_functions, label_clusters, load_rows
+    from .cluster import (
+        cluster_functions, graph_communities, label_clusters, load_rows,
+    )
 
     store = Store()
     sha = _resolve_sha(store, binary)
@@ -414,7 +417,10 @@ def clusters(
     if model is None and len(indexed) == 1:
         model = indexed.pop()
     rows = load_rows(store, sha, model or "")
-    groups = cluster_functions(rows, threshold)
+    groups = (
+        graph_communities(rows) if graph
+        else cluster_functions(rows, threshold)
+    )
 
     labels = [""] * len(groups)
     if label:

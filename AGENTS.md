@@ -107,6 +107,8 @@ oe lift <binary> --clustered [-t 0.25]          # arch v2: module prepass →
 oe match <a> <b> [-n N]             # cross-binary function alignment (cosine sim)
 oe clusters <bin> [-t 0.25] [--label] [--out map.json]
                                     # subsystem clustering on embeddings
+oe clusters <bin> --graph           # call-graph communities instead — exact,
+                                    # no embedder needed (shared-callee signal)
 oe splice <target> --from <donor> --seed <fn>...   # graft donor subsystem into target
 oe mksft <src.c>... [-o sft/pairs.jsonl] [--opts O0,O1,O2,Os]
                                     # SFT pair gen: compile→decompile→align

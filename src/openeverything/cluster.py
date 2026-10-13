@@ -39,6 +39,55 @@ def cluster_functions(
     return sorted(groups.values(), key=len, reverse=True)
 
 
+def graph_communities(
+    rows: list[dict], max_rounds: int = 50
+) -> list[list[dict]]:
+    """Label-propagation communities on the call graph — no embeddings.
+
+    Two functions are related if they share a neighbor (same callee like
+    `_strcoll`, same caller like a sort dispatcher) or are directly linked.
+    Score weight: 2 per shared neighbor + 3 for a direct edge.
+    """
+    names = [r["name"] for r in rows]
+    in_bin = set(names)
+    neighbors = {
+        r["name"]: set(r["callees"]) | set(r["callers"]) for r in rows
+    }
+    direct = {
+        r["name"]: {
+            c for c in r["callees"] if c in in_bin
+        } | {
+            c for c in r["callers"] if c in in_bin
+        }
+        for r in rows
+    }
+    labels = {n: n for n in names}  # deterministic: own name as seed
+    for _ in range(max_rounds):
+        changed = False
+        for n in names:  # stable order
+            scores: dict[str, int] = defaultdict(int)
+            nset = neighbors[n]
+            for other in names:
+                if other == n:
+                    continue
+                shared = len(nset & neighbors[other])
+                w = 2 * shared + (3 if other in direct[n] else 0)
+                if w:
+                    scores[labels[other]] += w
+            if not scores:
+                continue
+            best = max(scores, key=lambda k: (scores[k], k))
+            if best != labels[n]:
+                labels[n] = best
+                changed = True
+        if not changed:
+            break
+    groups: dict[str, list[dict]] = defaultdict(list)
+    for r in rows:
+        groups[labels[r["name"]]].append(r)
+    return sorted(groups.values(), key=len, reverse=True)
+
+
 def load_rows(store: Store, sha: str, model: str) -> list[dict]:
     rows = (
         store._table()
