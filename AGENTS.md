@@ -112,6 +112,8 @@ oe clusters <bin> --graph           # call-graph communities instead — exact,
 oe splice <target> --from <donor> --seed <fn>...   # graft donor subsystem into target
 oe mksft <src.c>... [-o sft/pairs.jsonl] [--opts O0,O1,O2,Os]
                                     # SFT pair gen: compile→decompile→align
+oe mkemb <binary>... [-o emb/pairs.jsonl]     # embedder SFT: community
+                                    # {anchor,positive,negative} triplets
 oe functions <binary>               # list functions
 oe binaries                         # list indexed binaries
 oe rm <binary>                      # drop from index

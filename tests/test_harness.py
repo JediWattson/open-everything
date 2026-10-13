@@ -213,6 +213,22 @@ def test_uleb128_decode():
     assert _uleb128(b"\xe5\x8e\x26", 0) == (0x98765, 3)
 
 
+def test_graph_communities_shared_neighbors():
+    from openeverything.cluster import graph_communities
+
+    # two comparators share callee _strcoll + caller dispatch → same community
+    rows = [
+        {"name": "cmp_a", "callees": ["_strcoll"], "callers": ["dispatch"]},
+        {"name": "cmp_b", "callees": ["_strcoll"], "callers": ["dispatch"]},
+        {"name": "dispatch", "callees": ["cmp_a", "cmp_b"], "callers": []},
+        {"name": "writer", "callees": ["_write"], "callers": []},
+    ]
+    groups = graph_communities(rows)
+    comm = {m["name"]: gi for gi, g in enumerate(groups) for m in g}
+    assert comm["cmp_a"] == comm["cmp_b"] == comm["dispatch"]
+    assert comm["writer"] != comm["cmp_a"]
+
+
 def test_cluster_order_callees_first():
     from openeverything.lift import _cluster_order
 

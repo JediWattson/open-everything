@@ -455,6 +455,35 @@ def clusters(
 
 
 @app.command()
+def mkemb(
+    binaries: list[str],
+    out: Path = typer.Option(Path("emb/pairs.jsonl"), "--out", "-o"),
+    max_pos: int = typer.Option(4, "--max-pos", help="Positives per anchor"),
+):
+    """Emit contrastive triplets from call-graph communities (embedder SFT)."""
+    from .cluster import community_pairs, graph_communities, load_rows
+
+    store = Store()
+    indexed = store.distinct_models()
+    model = next(iter(indexed)) if len(indexed) == 1 else ""
+    out.parent.mkdir(parents=True, exist_ok=True)
+    total = 0
+    with out.open("a") as f:
+        for b in binaries:
+            sha = _resolve_sha(store, b)
+            rows = load_rows(store, sha, model)
+            groups = graph_communities(rows)
+            pairs = community_pairs(groups, max_pos=max_pos)
+            for p in pairs:
+                f.write(json.dumps(p) + "\n")
+            total += len(pairs)
+            console.print(
+                f"[dim]{b}: {len(groups)} communities → {len(pairs)} triplets[/]"
+            )
+    console.print(f"[green]ok[/] {total} triplets → {out}")
+
+
+@app.command()
 def binaries():
     """List indexed binaries."""
     rows = Store().list_binaries()

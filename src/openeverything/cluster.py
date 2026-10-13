@@ -101,6 +101,41 @@ def load_rows(store: Store, sha: str, model: str) -> list[dict]:
     return [r for r in rows if r["decompiled"]]
 
 
+def community_pairs(
+    groups: list[list[dict]],
+    max_pos: int = 4,
+) -> list[dict]:
+    """Emit contrastive triplets from communities: anchor = a member's embed
+    text, positive = another same-community member's, negative = a member of
+    a different community. sentence-transformers (TripletLoss / MNRL) shape."""
+    from .embed import build_embed_text
+    from .models import FunctionRecord
+
+    def text(r: dict) -> str:
+        return build_embed_text(FunctionRecord(**{
+            k: r[k] for k in (
+                "binary_sha256", "binary_name", "address", "name",
+                "signature", "decompiled", "callees", "callers",
+                "strings", "is_external", "is_thunk", "size",
+            )
+        }))
+
+    pairs = []
+    multi = [g for g in groups if len(g) >= 2]
+    for gi, g in enumerate(multi):
+        negs = [m for j, gg in enumerate(multi) if j != gi for m in gg]
+        for a_i, a in enumerate(g):
+            for p in g[a_i + 1 : a_i + 1 + max_pos]:
+                if not negs:
+                    continue
+                pairs.append({
+                    "anchor": text(a),
+                    "positive": text(p),
+                    "negative": text(negs[(a_i + gi) % len(negs)]),
+                })
+    return pairs
+
+
 def describe_cluster(members: list[dict]) -> str:
     """Compact evidence blob for an LLM label call."""
     parts = []
