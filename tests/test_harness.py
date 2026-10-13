@@ -241,3 +241,37 @@ def test_cluster_order_callees_first():
     gC = [{"name": "c", "callees": ["d"]}]
     gD = [{"name": "d", "callees": ["c"]}]
     assert len(_cluster_order([gC, gD])) == 2
+
+
+def test_function_cfg_metrics():
+    from openeverything.cfg import function_cfg
+
+    # f(x): if (x) return 1; loop while (x--) {} ; return 0
+    asm = "\n".join([
+        "0x1000: cbz        w0, 0x1010",
+        "0x1004: mov        w0, #0x1",
+        "0x1008: ret",
+        "0x1010: subs       w0, w0, #0x1",
+        "0x1014: b.ge       0x1010",      # back edge → loop
+        "0x1018: mov        w0, #0x0",
+        "0x101c: ret",
+    ])
+    c = function_cfg(asm)
+    assert c["cyclomatic"] == 3   # cbz + b.ge + 1
+    assert c["loops"] == 1
+    assert c["blocks"] == 4
+
+    # straight-line: CC=1, no loops
+    c2 = function_cfg("0x2000: mov w0, #0x0\n0x2004: ret")
+    assert c2["cyclomatic"] == 1 and c2["loops"] == 0 and c2["blocks"] == 1
+
+    # tbz: bit-position hex must not be mistaken for the target; the nop
+    # after ret is an unreachable-but-real 4th block
+    asm3 = "\n".join([
+        "0x3000: tbz        w8, #0x3, 0x300c",
+        "0x3004: ret",
+        "0x3008: nop",
+        "0x300c: ret",
+    ])
+    c3 = function_cfg(asm3)
+    assert c3["cyclomatic"] == 2 and c3["blocks"] == 4

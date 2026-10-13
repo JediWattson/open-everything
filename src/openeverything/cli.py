@@ -535,13 +535,20 @@ def binaries():
 
 
 @app.command()
-def functions(binary: str, limit: int = typer.Option(200, "-n")):
+def functions(binary: str, limit: int = typer.Option(200, "-n"),
+              cfg: bool = typer.Option(False, "--cfg", help="Show CFG metrics (cyclomatic complexity, loops, blocks)")):
     """List functions in an indexed binary."""
     store = Store()
     sha = _resolve_sha(store, binary)
-    table = Table("name", "address", "size", "calls")
+    cols = ["name", "address", "size", "calls"] + (["CC", "loops", "blocks"] if cfg else [])
+    table = Table(*cols)
     for f in store.list_functions(sha, limit=limit):
-        table.add_row(f["name"], f["address"], str(f["size"]), ", ".join(f["callees"][:5]))
+        row = [f["name"], f["address"], str(f["size"]), ", ".join(f["callees"][:5])]
+        if cfg:
+            from .cfg import function_cfg
+            c = function_cfg(f["decompiled"]) if f["decompiled"] else {}
+            row += [str(c.get("cyclomatic", "")), str(c.get("loops", "")), str(c.get("blocks", ""))]
+        table.add_row(*row)
     console.print(table)
 
 
