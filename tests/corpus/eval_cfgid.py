@@ -35,6 +35,19 @@ _OPTFLAGS = {
     "Os-fi": ["-Os", "-fno-inline"],
 }
 
+# BSD sources reference sandboxing/libutil symbols macOS lacks — stub them.
+# Function-like -D macros only expand where referenced, so harmless elsewhere.
+_STUBS = [
+    "-Dpledge(a,b)=0", "-Dunveil(a,b)=0", "-Du_long=unsigned long",
+    "-Dreallocarray(p,n,s)=realloc(p,(n)*(s))",
+    "-Dtimespecclear(t)=((t)->tv_sec=(t)->tv_nsec=0)",
+    "-Dtimespecisset(t)=((t)->tv_sec||(t)->tv_nsec)",
+    "-Dchflagsat(a,b,c,d)=0", "-Duid_from_user(n,u)=0",
+    "-Dgid_from_group(n,g)=0",
+    "-Dfmt_scaled(n,b)=snprintf(b,16,\"%lld\",(long long)n)",
+    "-DMACHINE_ARCH=\"arm64\"", "-DFMT_SCALED_STRSIZE=16",
+]
+
 
 def fingerprint(rec) -> tuple | None:
     if not rec.decompiled or rec.is_external or rec.is_thunk:
@@ -103,7 +116,8 @@ def main() -> None:
             for opt in OPTS:
                 binary = Path(td) / f"{src.stem}-{opt}"
                 cp = subprocess.run(
-                    ["cc", *_OPTFLAGS[opt], "-o", str(binary), str(src)],
+                    ["cc", *_OPTFLAGS[opt], *_STUBS,
+                     "-o", str(binary), str(src)],
                     capture_output=True, text=True)
                 if cp.returncode != 0:
                     print(f"{src.name}:{opt} compile failed", file=sys.stderr)
