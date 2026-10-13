@@ -102,3 +102,33 @@ def function_cfg(asm: str) -> dict:
         "loops": len({dst for _, dst in back}),
         "indirect": indirect,
     }
+
+
+def fingerprint(rec: dict) -> tuple | None:
+    """(numeric vec, callee-set) structural fingerprint for identity
+    matching — nearly opt-level-invariant. None for bodiless rows."""
+    import math
+
+    if not rec.get("decompiled") or rec.get("is_external") \
+            or rec.get("is_thunk"):
+        return None
+    c = function_cfg(rec["decompiled"])
+    if not c["blocks"]:
+        return None
+    vec = (
+        c["cyclomatic"], c["blocks"], c["edges"], c["loops"],
+        c["indirect"], math.log1p(rec.get("size") or 1),
+        len(rec.get("callees") or ()),
+    )
+    return vec, frozenset(rec.get("callees") or ())
+
+
+def fdist(a: tuple, b: tuple) -> float:
+    """Fingerprint distance: relative diff on numeric features +
+    callee-set Jaccard (weight 2 — call targets are the most
+    opt-invariant signal)."""
+    (va, ca), (vb, cb) = a, b
+    num = sum(abs(x - y) / (x + y + 1.0) for x, y in zip(va, vb))
+    if ca or cb:
+        num += 2.0 * (1 - len(ca & cb) / len(ca | cb))
+    return num

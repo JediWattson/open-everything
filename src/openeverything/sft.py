@@ -24,6 +24,10 @@ from .lift import _SYSTEM as LIFT_SYSTEM
 
 _DEFAULT_OPTS = ("O0", "O1", "O2", "Os")
 
+# fno-inline keeps static-function boundaries at higher opt levels — most
+# identity signal lives in O0-vs-optimized, not O1-vs-O2
+_IDENT_OPTS = ("O0", "O1", "O2", "Os")
+
 
 def source_functions(src: Path) -> dict[str, str]:
     """name -> full source text of each function definition (clang AST)."""
@@ -164,6 +168,98 @@ def generate_pairs(
                         )
                         stats["pairs"] += 1
                 stats["missing"][f"{src.name}:{opt}"] = len(recs)
+    return stats
+
+
+_IDENT_FLAGS = {
+    "O0": ["-O0"],
+    "O1": ["-O1", "-fno-inline"],
+    "O2": ["-O2", "-fno-inline"],
+    "Os": ["-Os", "-fno-inline"],
+}
+
+# BSD userland sources reference sandboxing/libutil symbols macOS lacks —
+# function-like -D macros only expand where referenced, harmless elsewhere.
+_BSD_STUBS = [
+    "-Dpledge(a,b)=0", "-Dunveil(a,b)=0", "-Du_long=unsigned long",
+    "-Dreallocarray(p,n,s)=realloc(p,(n)*(s))",
+    "-Dtimespecclear(t)=((t)->tv_sec=(t)->tv_nsec=0)",
+    "-Dtimespecisset(t)=((t)->tv_sec||(t)->tv_nsec)",
+    "-Dchflagsat(a,b,c,d)=0", "-Duid_from_user(n,u)=0",
+    "-Dgid_from_group(n,g)=0",
+    "-Dfmt_scaled(n,b)=snprintf(b,16,\"%lld\",(long long)n)",
+    "-DMACHINE_ARCH=\"arm64\"", "-DFMT_SCALED_STRSIZE=16",
+]
+
+
+def generate_identity_pairs(
+    sources: list[Path],
+    out_path: Path,
+    opts: tuple[str, ...] = _IDENT_OPTS,
+    on_progress=None,
+) -> dict:
+    """Cross-opt-level identity triplets: for each source function that
+    survives as a distinct symbol in >=2 opt builds, emit
+    {anchor: asm@optA, positive: asm@optB, negative: asm@optA of another fn}.
+    Both directions emitted (anchor@B, positive@A) — symmetric pairs."""
+    out_path = Path(out_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    stats = {"files": 0, "binaries": 0, "pairs": 0, "funcs": {}}
+    with tempfile.TemporaryDirectory() as td:
+        for src in sources:
+            src = Path(src)
+            stats["files"] += 1
+            by_opt: dict[str, dict[str, object]] = {}
+            for opt in opts:
+                binary = Path(td) / f"{src.stem}-{opt}"
+                cp = subprocess.run(
+                    ["cc", *_IDENT_FLAGS[opt], *_BSD_STUBS,
+                     "-o", str(binary), str(src)],
+                    capture_output=True, text=True,
+                )
+                if cp.returncode != 0:
+                    continue
+                stats["binaries"] += 1
+                sha = hashlib.sha256(binary.read_bytes()).hexdigest()
+                by_opt[opt] = {}
+                for rec in extract_disasm(
+                    binary, sha, f"{src.stem}-{opt}", on_progress=on_progress
+                ):
+                    key = rec.name.lstrip("_")
+                    if (rec.is_external or rec.is_thunk
+                            or not rec.decompiled or key in by_opt[opt]):
+                        continue
+                    by_opt[opt][key] = rec
+            present = set.intersection(
+                *(set(v) for v in by_opt.values())) if by_opt else set()
+            stats["funcs"][src.name] = len(present)
+            with out_path.open("a") as f:
+                for name in sorted(present):
+                    for i, a in enumerate(opts):
+                        for b in opts[i + 1:]:
+                            if a not in by_opt or b not in by_opt:
+                                continue
+                            ra, rb = by_opt[a][name], by_opt[b][name]
+                            negs = [
+                                r for n2, r in by_opt[a].items() if n2 != name
+                            ]
+                            if not negs:
+                                continue
+                            neg = build_embed_text(
+                                negs[hash(name) % len(negs)])
+                            ta, tb = (build_embed_text(ra),
+                                      build_embed_text(rb))
+                            meta = {"src": str(src), "func": name,
+                                    "opt_a": a, "opt_b": b}
+                            f.write(json.dumps({
+                                "anchor": ta, "positive": tb,
+                                "negative": neg, "meta": meta}) + "\n")
+                            f.write(json.dumps({
+                                "anchor": tb, "positive": ta,
+                                "negative": neg,
+                                "meta": {**meta, "opt_a": b,
+                                         "opt_b": a}}) + "\n")
+                            stats["pairs"] += 2
     return stats
 
 

@@ -12,7 +12,6 @@ Run: .venv/bin/python tests/corpus/eval_cfgid.py tests/corpus/*.c
 from __future__ import annotations
 
 import hashlib
-import math
 import subprocess
 import sys
 import tempfile
@@ -20,7 +19,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent / "src"))
 
-from openeverything.cfg import function_cfg
+from openeverything.cfg import fdist, fingerprint
 from openeverything.disasm import extract_disasm
 
 # -fi = -fno-inline: keeps function boundaries while bodies are optimized —
@@ -49,27 +48,10 @@ _STUBS = [
 ]
 
 
-def fingerprint(rec) -> tuple | None:
+def _fp(rec) -> tuple | None:
     if not rec.decompiled or rec.is_external or rec.is_thunk:
         return None
-    c = function_cfg(rec.decompiled)
-    if not c["blocks"]:
-        return None
-    vec = (
-        c["cyclomatic"], c["blocks"], c["edges"], c["loops"],
-        c["indirect"], math.log1p(rec.size), len(rec.callees),
-    )
-    # callee multiset: which externs/local fns it calls — nearly opt-invariant
-    callees = frozenset(rec.callees)
-    return vec, callees
-
-
-def fdist(a: tuple, b: tuple) -> float:
-    (va, ca), (vb, cb) = a, b
-    num = sum(abs(x - y) / (x + y + 1.0) for x, y in zip(va, vb))
-    if ca or cb:
-        num += 2.0 * (1 - len(ca & cb) / len(ca | cb))
-    return num
+    return fingerprint(vars(rec))
 
 
 def rank_stats(queries: dict, cands: dict) -> dict:
@@ -126,7 +108,7 @@ def main() -> None:
                 fns = {}
                 for rec in extract_disasm(binary, sha, binary.name):
                     key = rec.name.lstrip("_")
-                    fp = fingerprint(rec)
+                    fp = _fp(rec)
                     if fp is None or key in fns:
                         continue
                     vec = None

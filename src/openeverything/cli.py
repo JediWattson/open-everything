@@ -319,10 +319,11 @@ def match(
     from .match import match_binaries
 
     rows = match_binaries(store, sha_a, sha_b, model or "")
-    table = Table(a, "→", b, "sim", "verdict", title=f"{a} × {b}")
+    table = Table(a, "→", b, "sim", "fpd", "verdict", title=f"{a} × {b}")
     for r in rows[:limit]:
         color = {"same": "green", "similar": "yellow", "novel": "red"}[r["verdict"]]
         table.add_row(r["a_name"], "→", r["b_name"], f"{r['sim']:.3f}",
+                      "-" if r["fpd"] is None else f"{r['fpd']:.2f}",
                       f"[{color}]{r['verdict']}[/]")
     console.print(table)
     counts = {}
@@ -365,9 +366,12 @@ def mksft(
     out: Path = typer.Option(Path("sft/lift-pairs.jsonl"), "--out", "-o"),
     opts: str = typer.Option("O0,O1,O2,Os", "--opts", help="Optimization levels"),
     emb: bool = typer.Option(False, "--emb", help="Emit {anchor,positive,negative} asm↔source triplets (embedder SFT)"),
+    ident: bool = typer.Option(False, "--ident", help="Emit asm@optA↔asm@optB identity pairs for the same source function"),
 ):
     """Generate (decompiled, source) SFT pairs by compiling C sources."""
-    from .sft import generate_emb_pairs, generate_pairs
+    from .sft import (
+        generate_emb_pairs, generate_identity_pairs, generate_pairs,
+    )
 
     srcs: list[Path] = []
     for s in sources:
@@ -383,7 +387,9 @@ def mksft(
         raise typer.Exit(1)
     console.print(f"[dim]{len(srcs)} source files[/]")
 
-    gen = generate_emb_pairs if emb else generate_pairs
+    gen = (generate_identity_pairs if ident
+           else generate_emb_pairs if emb
+           else generate_pairs)
     stats = gen(
         srcs, out, tuple(opts.split(",")),
         on_progress=lambda i, n, name: err.print(
@@ -393,9 +399,11 @@ def mksft(
         f"[green]ok[/] {stats['pairs']} pairs → {out} "
         f"({stats['binaries']} binaries from {stats['files']} files)"
     )
-    for k, names in stats["unmatched"].items():
+    for k, names in stats.get("unmatched", {}).items():
         if names:
             err.print(f"  unmatched in {k}: {names}")
+    for k, n in stats.get("funcs", {}).items():
+        console.print(f"[dim]{k}: {n} fns in >=2 opt builds[/]")
 
 
 @app.command()
