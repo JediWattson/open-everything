@@ -19,6 +19,61 @@ from .embed import _force_bidirectional
 _SCALE = 20.0  # MNRL temperature
 
 
+def _save_adapter(model, lconf, model_name: str, out_dir: Path) -> None:
+    """Emit just the LoRA tensors as a peft-loadable adapter dir.
+
+    peft's save_pretrained dumps merged weights on this stack — emit the
+    adapter files explicitly instead."""
+    from safetensors.torch import save_file
+
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    sd = {
+        "base_model.model." + k: v.cpu()
+        for k, v in model[0].auto_model.state_dict().items()
+        if ".lora_" in k
+    }
+    save_file(sd, out_dir / "adapter_model.safetensors")
+    (out_dir / "adapter_config.json").write_text(json.dumps({
+        "peft_type": "LORA",
+        "base_model_name_or_path": model_name,
+        "r": lconf.r, "lora_alpha": lconf.lora_alpha,
+        "lora_dropout": lconf.lora_dropout, "bias": "none",
+        "target_modules": list(lconf.target_modules),
+        "task_type": "FEATURE_EXTRACTION",
+    }))
+    (out_dir / "base_model.txt").write_text(model_name)
+
+
+def _save_checkpoint(model, lconf, model_name, opt, step, ckpt_dir) -> None:
+    _save_adapter(model, lconf, model_name, ckpt_dir)
+    import torch
+    torch.save(opt.state_dict(), ckpt_dir / "optimizer.pt")
+    (ckpt_dir / "trainer_state.json").write_text(
+        json.dumps({"step": step}))
+
+
+def _load_checkpoint(model, opt, ckpt_dir, device) -> int:
+    from safetensors.torch import load_file
+    import torch
+
+    ckpt_dir = Path(ckpt_dir)
+    sd = {
+        k.removeprefix("base_model.model."): v.to(device)
+        for k, v in load_file(ckpt_dir / "adapter_model.safetensors").items()
+    }
+    model[0].auto_model.load_state_dict(sd, strict=False)
+    opt_file = ckpt_dir / "optimizer.pt"
+    if opt_file.exists():
+        opt.load_state_dict(torch.load(opt_file, weights_only=True))
+        for st in opt.state.values():
+            for k, v in st.items():
+                if isinstance(v, torch.Tensor):
+                    st[k] = v.to(device)
+    state = json.loads((ckpt_dir / "trainer_state.json").read_text())
+    return int(state["step"])
+
+
 def load_triplets(paths: list[Path]) -> list[list[str]]:
     rows = []
     for p in paths:
@@ -41,6 +96,8 @@ def train(
     lr: float = 2e-5,
     max_len: int = 1024,
     device: str = "mps",
+    ckpt_every: int = 0,
+    resume: Path | None = None,
     on_progress=None,
 ) -> Path:
     import torch
@@ -82,7 +139,7 @@ def train(
     opt = torch.optim.AdamW(trainable, lr=lr)
     steps = epochs * len(loader)
 
-    step = 0
+    step = _load_checkpoint(model, opt, resume, device) if resume else 0
     for ep in range(epochs):
         for feats, _labels in loader:
             feats = [
@@ -105,29 +162,14 @@ def train(
             opt.step()
             step += 1
             if on_progress:
-                on_progress(step, steps, float(loss))
+                on_progress(step, steps, float(loss.detach()))
+            if ckpt_every and step % ckpt_every == 0:
+                _save_checkpoint(
+                    model, lconf, model_name, opt, step,
+                    Path(out_dir) / f"checkpoint-{step}")
 
     out_dir = Path(out_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
-    # peft's save_pretrained dumps merged weights on this stack — emit the
-    # adapter files explicitly instead.
-    from safetensors.torch import save_file
-
-    sd = {
-        "base_model.model." + k: v.cpu()
-        for k, v in model[0].auto_model.state_dict().items()
-        if ".lora_" in k
-    }
-    save_file(sd, out_dir / "adapter_model.safetensors")
-    (out_dir / "adapter_config.json").write_text(json.dumps({
-        "peft_type": "LORA",
-        "base_model_name_or_path": model_name,
-        "r": lconf.r, "lora_alpha": lconf.lora_alpha,
-        "lora_dropout": lconf.lora_dropout, "bias": "none",
-        "target_modules": list(lconf.target_modules),
-        "task_type": "FEATURE_EXTRACTION",
-    }))
-    (out_dir / "base_model.txt").write_text(model_name)
+    _save_adapter(model, lconf, model_name, out_dir)
     return out_dir
 
 

@@ -492,18 +492,24 @@ def trainemb(
     model: str | None = typer.Option(None, "--model", "-m"),
     eval_binary: str | None = typer.Option(None, "--eval", help="Cluster-ARI eval vs graph communities on this binary"),
     threshold: float = typer.Option(0.25, "-t"),
+    ckpt_every: int = typer.Option(0, "--ckpt-every", help="Snapshot adapter+optimizer every N steps into out/checkpoint-N"),
+    resume: Path | None = typer.Option(None, "--resume", help="Resume weights+optimizer from a checkpoint dir"),
 ):
     """LoRA-tune the embedder on {anchor,positive,negative} triplets."""
     from .embed_train import eval_clusters, train
     from .cluster import load_rows
 
     model_name = model or config.DEFAULT_EMBED_MODEL
+
+    def _prog(s, n, l):
+        if s % 10 == 0 or s == n:
+            err.print(f"[dim]{s}/{n} loss={l:.3f}[/]", highlight=False)
+            err.file.flush()
+
     out_dir = train(
         list(pairs), out, model_name, epochs=epochs,
-        batch_size=batch, lr=lr,
-        on_progress=lambda s, n, l: err.print(
-            f"[dim]{s}/{n} loss={l:.3f}[/]", highlight=False)
-        if s % 10 == 0 or s == n else None,
+        batch_size=batch, lr=lr, ckpt_every=ckpt_every, resume=resume,
+        on_progress=_prog,
     )
     console.print(f"[green]ok[/] adapter → {out_dir}")
     if eval_binary:
