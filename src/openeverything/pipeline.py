@@ -28,6 +28,7 @@ def ingest(
     force: bool = False,
     on_progress=None,
     graph: GraphStore | None = None,
+    frontend: str = "ghidra",
 ) -> tuple[str, int]:
     """Ingest one binary. Returns (binary_sha256, n_functions)."""
     binary = binary.resolve()
@@ -44,8 +45,12 @@ def ingest(
         if graph is not None:
             graph.drop_binary(sha)
 
+    if frontend == "disasm":
+        from .disasm import extract_disasm as extract
+    else:
+        extract = extract_functions
     recs: list[FunctionRecord] = list(
-        extract_functions(binary, sha, name, on_progress=on_progress)
+        extract(binary, sha, name, on_progress=on_progress)
     )
     for r in recs:
         r.model = embedder.model_name

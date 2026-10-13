@@ -48,6 +48,7 @@ def ingest(
     name: str | None = typer.Option(None, help="Override binary name (single file only)"),
     force: bool = typer.Option(False, "--force", "-f", help="Re-ingest even if sha256 already indexed"),
     model: str | None = typer.Option(None, "--model", "-m", help="Embedding model (default: OE_EMBED_MODEL)"),
+    frontend: str = typer.Option("ghidra", "--frontend", help="ghidra | disasm (Ghidra-free: LC_FUNCTION_STARTS + otool)"),
 ):
     """Decompile binaries and index their functions."""
     store = Store()
@@ -70,6 +71,7 @@ def ingest(
             sha, n = pipeline.ingest(
                 binary, store, embedder, name=name if len(binaries) == 1 else None,
                 force=force, on_progress=on_prog, graph=graph,
+                frontend=frontend,
             )
         if n == 0:
             console.print(f"[yellow]skip[/] {binary.name} (already indexed, use --force)")

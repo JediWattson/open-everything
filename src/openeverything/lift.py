@@ -92,7 +92,13 @@ def _lift_prompt(rec: dict, symbols: dict) -> list[dict]:
                      + "\n  ".join(callee_sigs))
     if rec["strings"]:
         parts.append("strings: " + " | ".join(rec["strings"][:10]))
-    parts += ["decompiled:", "```c", rec["decompiled"], "```"]
+    is_asm = rec["decompiled"].startswith("0x")
+    parts += [
+        "disassembled:" if is_asm else "decompiled:",
+        "```asm" if is_asm else "```c",
+        rec["decompiled"],
+        "```",
+    ]
     return [
         {"role": "system", "content": _SYSTEM},
         {"role": "user", "content": "\n".join(parts)},

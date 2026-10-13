@@ -91,6 +91,8 @@ Notes:
 
 ```sh
 oe ingest <binary>... [--force] [-m model]      # decompile + embed + index
+oe ingest --frontend disasm <bin>...            # Ghidra-free: LC_FUNCTION_STARTS
+                                    # + otool arm64 asm + stub names (no JVM)
 oe search "<query>" [-k N] [-b bin] [-m model] [--code] [--all]
 oe show <func> -b <binary>          # print pseudocode
 oe graph <func> -b <binary> [-d N] [--callers]   # transitive call graph

@@ -205,6 +205,14 @@ def test_agent_logs_trajectory(tmp_path):
                                    "content": '{"answer": "done"}'}
 
 
+def test_uleb128_decode():
+    from openeverything.disasm import _uleb128
+
+    assert _uleb128(b"\x0c", 0) == (0x0C, 1)
+    assert _uleb128(b"\x80\x0e", 0) == (0x700, 2)
+    assert _uleb128(b"\xe5\x8e\x26", 0) == (0x98765, 3)
+
+
 def test_cluster_order_callees_first():
     from openeverything.lift import _cluster_order
 
