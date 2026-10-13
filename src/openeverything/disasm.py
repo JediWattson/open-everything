@@ -67,6 +67,7 @@ class MachO:
         self.text_seg_base = 0
         self.text_addr = self.text_size = self.text_off = 0
         self.stubs: dict[str, tuple[int, int, int]] = {}  # name->(addr,size,rsv1)
+        self.cstring: tuple[int, int, int] | None = None  # (addr,size,fileoff)
         self.func_starts: list[int] = []
         self.symbols: dict[int, str] = {}
         self.sym_names: list[str] = []     # symtab index -> name
@@ -86,6 +87,18 @@ class MachO:
             off += cmdsize
         self.func_starts = self._decode_starts()
 
+    def read_cstring(self, addr: int) -> str | None:
+        """Read the NUL-terminated string at a vmaddr inside __cstring."""
+        if not self.cstring:
+            return None
+        base, size, fileoff = self.cstring
+        if not (base <= addr < base + size):
+            return None
+        start = fileoff + (addr - base)
+        end = self.raw.index(b"\0", start)
+        s = self.raw[start:end].decode(errors="replace")
+        return s if s and all(c.isprintable() or c in "\t\n" for c in s) else None
+
     def _segment(self, off: int):
         segname = self.raw[off + 8 : off + 24].split(b"\0")[0].decode()
         (vmaddr,) = struct.unpack_from("<Q", self.raw, off + 24)
@@ -103,6 +116,8 @@ class MachO:
                 self.text_addr, self.text_size, self.text_off = (
                     addr, size, fileoff,
                 )
+            elif name == "__cstring":
+                self.cstring = (addr, size, fileoff)
             elif name in ("__stubs", "__auth_stubs"):
                 self.stubs[name] = (addr, size, reserved1)
 
@@ -159,6 +174,38 @@ class MachO:
 
 _BL_RE = re.compile(r"\bb(l|)\s+(0x?[0-9a-f]+)", re.I)
 _ADDR_RE = re.compile(r"^([0-9a-f]{8,16})\s")
+# otool annotates resolved references: `adrp x8, 12 ; 0x10000c000`,
+# `add x8, x8, #0x2c ; literal pool for: "…"`,
+# `bl 0x… ; symbol stub for: _name`
+_ADRP_RE = re.compile(r"\badrp\s+(x\d+),\s*\d+\s*;\s*(0x[0-9a-f]+)")
+_ADD_RE = re.compile(r"\badd\s+x\d+,\s*(x\d+),\s*#(0x[0-9a-f]+|\d+)")
+_ADR_RE = re.compile(r"\badr\s+x\d+,\s*(0x[0-9a-f]+)")
+_LIT_RE = re.compile(r';\s*literal pool for:\s*"?([^";]*)"?$')
+_STUB_RE = re.compile(r";\s*symbol stub for:\s*(\w+)")
+
+
+def _fn_strings(mo: MachO, body_ins: list[str]) -> list[str]:
+    """Resolve string references per function body: literal-pool comments
+    first, adrp+add / adr address resolution as fallback."""
+    pages: dict[str, int] = {}
+    out: list[str] = []
+    for ins in body_ins:
+        if m := _LIT_RE.search(ins):
+            if m.group(1).strip():
+                out.append(m.group(1).strip())
+        if m := _ADRP_RE.search(ins):
+            pages[m.group(1)] = int(m.group(2), 0)
+        elif m := _ADR_RE.search(ins):
+            s = mo.read_cstring(int(m.group(1), 0))
+            if s:
+                out.append(s)
+        elif m := _ADD_RE.search(ins):
+            page = pages.get(m.group(1))
+            if page is not None:
+                s = mo.read_cstring(page + int(m.group(2), 0))
+                if s:
+                    out.append(s)
+    return list(dict.fromkeys(out))[:20]
 
 
 def disasm_text(binary: Path) -> dict[int, str]:
@@ -188,6 +235,11 @@ def extract_disasm(
     insns = disasm_text(binary)
     insn_addrs = sorted(insns)
     stub_by_addr = dict(mo.stub_functions())
+    # `; symbol stub for: _name` comments name stub call targets directly
+    for ins in insns.values():
+        m = _BL_RE.search(ins)
+        if m and (s := _STUB_RE.search(ins)):
+            stub_by_addr.setdefault(int(m.group(2), 0), s.group(1))
 
     # boundaries: LC_FUNCTION_STARTS ∪ bl-targets in __text or stubs.
     # `bl` is always a call target; a bare `b` inside an existing region is an
@@ -260,7 +312,7 @@ def extract_disasm(
             decompiled=asm or f"external stub -> {name}",
             callees=sorted(set(callees)),
             callers=[],
-            strings=[],
+            strings=_fn_strings(mo, body_ins),
             is_external=is_stub,
             is_thunk=is_stub,
             size=max(0, end - start),

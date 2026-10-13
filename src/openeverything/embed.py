@@ -84,20 +84,23 @@ class Embedder:
 
         self.model_name = model_name or config.DEFAULT_EMBED_MODEL
         device = _pick_device()
-        # bf16 halves weight memory on MPS — fp32 doesn't fit a 16 GB Mac's
-        # unified-memory cap for >1B models
-        model_kwargs = {"dtype": "bfloat16"} if device == "mps" else {}
         try:
             self._model = SentenceTransformer(
                 self.model_name, trust_remote_code=True, device=device,
-                model_kwargs=model_kwargs,
             )
         except (AttributeError, ImportError, ModuleNotFoundError):
             # remote code predating transformers 5.x — use the native arch
             self._model = SentenceTransformer(
                 self.model_name, trust_remote_code=False, device=device,
-                model_kwargs=model_kwargs,
             )
+        if device == "mps" and os.environ.get("OE_EMBED_DTYPE", "bf16") == "bf16":
+            # bf16 halves weight memory — fp32 doesn't fit a 16 GB Mac's
+            # unified-memory cap for >1B models. Cast post-load on-device:
+            # dtype-at-load takes a pathological per-tensor sync-copy path.
+            # OE_EMBED_DTYPE=fp32 skips the cast (faster but ~6 GB resident).
+            import torch
+
+            self._model.to(torch.bfloat16)
         _force_bidirectional(self._model[0].model)
         self.dim = int(self._model.get_embedding_dimension())
         prompts = getattr(self._model, "prompts", {}) or {}

@@ -56,7 +56,9 @@ def ingest(
         r.model = embedder.model_name
         r.embed_text = build_embed_text(r)
 
-    batch = 16  # keeps activation memory sane for large models on MPS
+    import os
+
+    batch = int(os.environ.get("OE_EMBED_BATCH", "16"))
     for i in range(0, len(recs), batch):
         vecs = embedder.embed_docs([r.embed_text for r in recs[i : i + batch]])
         for r, v in zip(recs[i : i + batch], vecs):

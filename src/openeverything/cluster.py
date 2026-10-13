@@ -9,9 +9,7 @@ preset k. An optional LLM pass labels each cluster for readability.
 from __future__ import annotations
 
 import json
-import subprocess
 from collections import defaultdict
-from pathlib import Path
 
 import numpy as np
 
@@ -63,41 +61,6 @@ def describe_cluster(members: list[dict]) -> str:
             s += f" strs[{','.join(m['strings'][:5])}]"
         parts.append(s)
     return "\n".join(parts)
-
-
-def disasm_functions(binary: Path, rows: list[dict]) -> dict[str, str]:
-    """addr -> asm text per function, carved out of `otool -tv` output using
-    the function entry addresses Ghidra recovered (boundaries borrowed —
-    everything else is model-side)."""
-    out = subprocess.run(
-        ["otool", "-tv", str(binary)], capture_output=True, text=True
-    ).stdout
-    entries = sorted(int(r["address"], 16) for r in rows)
-    by_addr = {int(r["address"], 16): r["name"] for r in rows}
-    per_fn: dict[str, list[str]] = {}
-    import bisect
-    import re as _re
-
-    for line in out.splitlines():
-        m = _re.match(r"^([0-9a-f]{8,16})\s", line)
-        if not m:
-            continue
-        addr = int(m.group(1), 16)
-        i = bisect.bisect_right(entries, addr) - 1
-        if i < 0:
-            continue
-        ins = line[m.end() :].strip()
-        # drop the raw-hex-bytes column, keep mnemonic+operands
-        ins = _re.sub(r"^[0-9a-f]{8}\s+", "", ins)
-        per_fn.setdefault(by_addr[entries[i]], []).append(ins)
-    return {k: "\n".join(v) for k, v in per_fn.items()}
-
-
-def asm_embed_text(name: str, asm: str, binary_name: str) -> str:
-    return (
-        f"function {name} in {binary_name} (disassembly)\n"
-        + asm[:6000]
-    )
 
 
 def label_clusters(

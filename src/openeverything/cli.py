@@ -51,9 +51,12 @@ def ingest(
     frontend: str = typer.Option("ghidra", "--frontend", help="ghidra | disasm (Ghidra-free: LC_FUNCTION_STARTS + otool)"),
 ):
     """Decompile binaries and index their functions."""
+    # NB: load the embedder BEFORE opening LanceDB/SQLite — importing those
+    # native libs first makes torch's CPU->MPS weight upload take a
+    # pathological per-tensor sync-copy path on this platform.
+    embedder = _embedder(model)
     store = Store()
     graph = GraphStore()
-    embedder = None
     for binary in binaries:
         from . import pipeline
 
@@ -65,9 +68,6 @@ def ingest(
                     prog.update(task, total=total)
                 prog.update(task, completed=i, description=f"[cyan]{binary.name}[/] {fname}")
 
-            if embedder is None:
-                prog.update(task, description=f"[cyan]{binary.name}[/] loading model…")
-                embedder = _embedder(model)
             sha, n = pipeline.ingest(
                 binary, store, embedder, name=name if len(binaries) == 1 else None,
                 force=force, on_progress=on_prog, graph=graph,
@@ -404,36 +404,16 @@ def clusters(
     llm_model: str | None = typer.Option(None, "--llm"),
     model: str | None = typer.Option(None, "--model", "-m"),
     out: Path | None = typer.Option(None, "--out", "-o", help="Write cluster map JSON"),
-    asm: bool = typer.Option(False, "--asm", help="Embed raw disassembly instead of Ghidra pseudocode"),
 ):
     """Group a binary's functions into subsystem clusters (embedding-based)."""
-    from .cluster import (
-        asm_embed_text, cluster_functions, disasm_functions,
-        label_clusters, load_rows,
-    )
+    from .cluster import cluster_functions, label_clusters, load_rows
 
     store = Store()
     sha = _resolve_sha(store, binary)
     indexed = store.distinct_models()
     if model is None and len(indexed) == 1:
         model = indexed.pop()
-    if asm:
-        bins = {b["binary_sha256"]: b for b in store.list_binaries()}
-        rows = load_rows(store, sha, model or "")
-        asm_map = disasm_functions(
-            Path(bins[sha]["path"]), rows)
-        emb = _embedder(model)
-        texts = [
-            asm_embed_text(r["name"], asm_map.get(r["name"], ""), binary)
-            for r in rows
-        ]
-        vecs = emb.embed_docs(texts)
-        rows = [
-            {**r, "vector": v, "callees": [], "strings": []}
-            for r, v in zip(rows, vecs)
-        ]
-    else:
-        rows = load_rows(store, sha, model or "")
+    rows = load_rows(store, sha, model or "")
     groups = cluster_functions(rows, threshold)
 
     labels = [""] * len(groups)
