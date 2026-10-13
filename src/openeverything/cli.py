@@ -461,9 +461,12 @@ def mkemb(
     binaries: list[str],
     out: Path = typer.Option(Path("emb/pairs.jsonl"), "--out", "-o"),
     max_pos: int = typer.Option(4, "--max-pos", help="Positives per anchor"),
+    supcon: bool = typer.Option(False, "--supcon", help="Emit {label,text} community rows for multi-positive contrastive training"),
 ):
     """Emit contrastive triplets from call-graph neighborhoods (embedder SFT)."""
-    from .cluster import neighbor_pairs, load_rows
+    from .cluster import (
+        community_labels, graph_communities, load_rows, neighbor_pairs,
+    )
 
     store = Store()
     indexed = store.distinct_models()
@@ -474,12 +477,13 @@ def mkemb(
         for b in binaries:
             sha = _resolve_sha(store, b)
             rows = load_rows(store, sha, model)
-            pairs = neighbor_pairs(rows, max_pos=max_pos)
+            pairs = (community_labels(graph_communities(rows), b)
+                     if supcon else neighbor_pairs(rows, max_pos=max_pos))
             for p in pairs:
                 f.write(json.dumps(p) + "\n")
             total += len(pairs)
-            console.print(f"[dim]{b}: {len(pairs)} triplets[/]")
-    console.print(f"[green]ok[/] {total} triplets → {out}")
+            console.print(f"[dim]{b}: {len(pairs)} rows[/]")
+    console.print(f"[green]ok[/] {total} rows → {out}")
 
 
 @app.command()

@@ -178,6 +178,21 @@ def community_pairs(
     return pairs
 
 
+def community_labels(
+    groups: list[list[dict]], bin_name: str, min_size: int = 3
+) -> list[dict]:
+    """Emit {label, text} rows for supervised-contrastive training: one row
+    per member of each community with >= min_size members. Label keying by
+    community id makes every same-community member a positive."""
+    rows = []
+    for gi, g in enumerate(groups):
+        if len(g) < min_size:
+            continue
+        for m in g:
+            rows.append({"label": f"{bin_name}:{gi}", "text": _row_text(m)})
+    return rows
+
+
 def neighbor_pairs(rows: list[dict], max_pos: int = 4) -> list[dict]:
     """Contrastive triplets from local call-graph neighborhoods — works even
     when global communities collapse: positives = top-scored neighbors,

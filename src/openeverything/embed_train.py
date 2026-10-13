@@ -87,6 +87,21 @@ def load_triplets(paths: list[Path]) -> list[list[str]]:
     return rows
 
 
+def load_labeled(paths: list[Path]) -> dict[str, list[str]]:
+    """{label, text} rows -> label -> member texts (supervised contrastive)."""
+    from collections import defaultdict
+
+    groups: dict[str, list[str]] = defaultdict(list)
+    for p in paths:
+        for line in Path(p).read_text().splitlines():
+            if not line.strip():
+                continue
+            d = json.loads(line)
+            if d.get("label") and d.get("text"):
+                groups[d["label"]].append(d["text"])
+    return {k: v for k, v in groups.items() if len(v) >= 2}
+
+
 def train(
     pair_paths: list[Path],
     out_dir: Path,
@@ -106,9 +121,10 @@ def train(
     from sentence_transformers import SentenceTransformer
     from peft import LoraConfig, get_peft_model
 
+    labeled = load_labeled(pair_paths)
     rows = load_triplets(pair_paths)
-    if not rows:
-        raise ValueError("no triplets loaded")
+    if not labeled and not rows:
+        raise ValueError("no triplets or labeled rows loaded")
 
     model = SentenceTransformer(
         model_name, trust_remote_code=False, device=device
@@ -130,43 +146,86 @@ def train(
 
     from sentence_transformers import InputExample
 
-    loader = DataLoader(
-        [InputExample(texts=r) for r in rows],
-        batch_size=batch_size, shuffle=True, drop_last=True,
-        collate_fn=model.smart_batching_collate,
-    )
     trainable = [p for p in model.parameters() if p.requires_grad]
     opt = torch.optim.AdamW(trainable, lr=lr)
-    steps = epochs * len(loader)
-
     step = _load_checkpoint(model, opt, resume, device) if resume else 0
-    for ep in range(epochs):
-        for feats, _labels in loader:
-            feats = [
-                {
-                    k: v.to(device) if isinstance(v, torch.Tensor) else v
-                    for k, v in f.items()
-                }
-                for f in feats[:3]
-            ]
-            a, p, n = [
-                F.normalize(model(f)["sentence_embedding"], dim=-1)
-                for f in feats
-            ]
-            scores = a @ torch.cat([p, n], 0).T * _SCALE
-            loss = F.cross_entropy(
-                scores, torch.arange(len(a), device=device)
-            )
-            opt.zero_grad()
-            loss.backward()
-            opt.step()
-            step += 1
-            if on_progress:
-                on_progress(step, steps, float(loss.detach()))
-            if ckpt_every and step % ckpt_every == 0:
-                _save_checkpoint(
-                    model, lconf, model_name, opt, step,
-                    Path(out_dir) / f"checkpoint-{step}")
+
+    def _to_dev(feats):
+        return [
+            {k: v.to(device) if isinstance(v, torch.Tensor) else v
+             for k, v in f.items()}
+            for f in feats
+        ]
+
+    def _after_step(loss):
+        nonlocal step
+        step += 1
+        if on_progress:
+            on_progress(step, steps, float(loss.detach()))
+        if ckpt_every and step % ckpt_every == 0:
+            _save_checkpoint(
+                model, lconf, model_name, opt, step,
+                Path(out_dir) / f"checkpoint-{step}")
+
+    if labeled:
+        # SupCon: each step samples communities x members; every same-label
+        # batchmate is a positive, everything else a negative. Multi-positive
+        # pressure — pulls communities together instead of pushing apart.
+        import random
+        rng = random.Random(0)
+        labels = sorted(labeled)
+        total = sum(len(v) for v in labeled.values())
+        comms, members = 2, max(2, batch_size // 2)
+        steps = epochs * max(1, total // (comms * members))
+        for ep in range(epochs):
+            for _ in range(max(1, total // (comms * members))):
+                batch, labs = [], []
+                for li, lab in enumerate(rng.sample(labels, comms)):
+                    pool = labeled[lab]
+                    picks = [rng.choice(pool) for _ in range(members)]
+                    batch.extend(picks)
+                    labs.extend([li] * members)
+                feats, _ = model.smart_batching_collate(
+                    [InputExample(texts=[t]) for t in batch])
+                z = F.normalize(
+                    model(_to_dev(feats)[0])["sentence_embedding"], dim=-1)
+                same = torch.tensor(labs, device=device)[:, None] == \
+                    torch.tensor(labs, device=device)[None, :]
+                same.fill_diagonal_(False)
+                logits = z @ z.T * _SCALE
+                logits.fill_diagonal_(-torch.inf)
+                logprob = logits - torch.logsumexp(
+                    logits, 1, keepdim=True)
+                # masked_fill, not *same: -inf * 0 is NaN at masked positions
+                pos = logprob.masked_fill(~same, 0).sum(1) / \
+                    same.sum(1).clamp(min=1)
+                loss = -pos[same.sum(1) > 0].mean()
+                opt.zero_grad()
+                loss.backward()
+                opt.step()
+                _after_step(loss)
+    else:
+        loader = DataLoader(
+            [InputExample(texts=r) for r in rows],
+            batch_size=batch_size, shuffle=True, drop_last=True,
+            collate_fn=model.smart_batching_collate,
+        )
+        steps = epochs * len(loader)
+        for ep in range(epochs):
+            for feats, _labels in loader:
+                feats = _to_dev(feats)[:3]
+                a, p, n = [
+                    F.normalize(model(f)["sentence_embedding"], dim=-1)
+                    for f in feats
+                ]
+                scores = a @ torch.cat([p, n], 0).T * _SCALE
+                loss = F.cross_entropy(
+                    scores, torch.arange(len(a), device=device)
+                )
+                opt.zero_grad()
+                loss.backward()
+                opt.step()
+                _after_step(loss)
 
     out_dir = Path(out_dir)
     _save_adapter(model, lconf, model_name, out_dir)
