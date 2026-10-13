@@ -114,6 +114,8 @@ oe mksft <src.c>... [-o sft/pairs.jsonl] [--opts O0,O1,O2,Os]
                                     # SFT pair gen: compile→decompile→align
 oe mkemb <binary>... [-o emb/pairs.jsonl]     # embedder SFT: community
                                     # {anchor,positive,negative} triplets
+oe mksft <src.c>... --emb [-o out.jsonl]      # embedder SFT: compile → disasm
+                                    # → name-align → asm↔source triplets
 oe functions <binary>               # list functions
 oe binaries                         # list indexed binaries
 oe rm <binary>                      # drop from index

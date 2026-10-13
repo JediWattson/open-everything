@@ -364,9 +364,10 @@ def mksft(
     sources: list[Path],
     out: Path = typer.Option(Path("sft/lift-pairs.jsonl"), "--out", "-o"),
     opts: str = typer.Option("O0,O1,O2,Os", "--opts", help="Optimization levels"),
+    emb: bool = typer.Option(False, "--emb", help="Emit {anchor,positive,negative} asm↔source triplets (embedder SFT)"),
 ):
     """Generate (decompiled, source) SFT pairs by compiling C sources."""
-    from .sft import generate_pairs
+    from .sft import generate_emb_pairs, generate_pairs
 
     srcs: list[Path] = []
     for s in sources:
@@ -382,7 +383,8 @@ def mksft(
         raise typer.Exit(1)
     console.print(f"[dim]{len(srcs)} source files[/]")
 
-    stats = generate_pairs(
+    gen = generate_emb_pairs if emb else generate_pairs
+    stats = gen(
         srcs, out, tuple(opts.split(",")),
         on_progress=lambda i, n, name: err.print(
             f"[dim]{i}/{n} {name}[/]"),

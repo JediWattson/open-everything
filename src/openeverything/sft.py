@@ -17,6 +17,8 @@ import subprocess
 import tempfile
 from pathlib import Path
 
+from .disasm import extract_disasm
+from .embed import build_embed_text
 from .extractor import extract_functions
 from .lift import _SYSTEM as LIFT_SYSTEM
 
@@ -152,6 +154,83 @@ def generate_pairs(
                                         {"role": "assistant",
                                          "content": json.dumps(target)},
                                     ],
+                                    "meta": {
+                                        "src": str(src), "opt": opt,
+                                        "func": key, "addr": rec.address,
+                                    },
+                                }
+                            )
+                            + "\n"
+                        )
+                        stats["pairs"] += 1
+                stats["missing"][f"{src.name}:{opt}"] = len(recs)
+    return stats
+
+
+def _src_doc(name: str, sig: str, body: str) -> str:
+    """Source-side document in embed_text layout — asm anchors map onto the
+    same shape the embedder sees for source-ish input."""
+    return f"function: {name}\nsignature: {sig}\n---\n{body.strip()}"
+
+
+def generate_emb_pairs(
+    sources: list[Path],
+    out_path: Path,
+    opts: tuple[str, ...] = _DEFAULT_OPTS,
+    on_progress=None,
+) -> dict:
+    """Compile → disasm → name-align each source; emit
+    {anchor(asm), positive(source), negative(other-source)} triplets."""
+    out_path = Path(out_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    stats = {"files": 0, "binaries": 0, "pairs": 0,
+             "unmatched": {}, "missing": {}}
+    with tempfile.TemporaryDirectory() as td:
+        for src in sources:
+            src = Path(src)
+            src_fns = source_functions(src)
+            src_sigs = {n: _signature_of(t) for n, t in src_fns.items()}
+            stats["files"] += 1
+            for opt in opts:
+                binary = Path(td) / f"{src.stem}-{opt}"
+                cp = subprocess.run(
+                    ["cc", f"-{opt}", "-o", str(binary), str(src)],
+                    capture_output=True, text=True,
+                )
+                if cp.returncode != 0:
+                    continue
+                stats["binaries"] += 1
+                sha = hashlib.sha256(binary.read_bytes()).hexdigest()
+                recs = list(
+                    extract_disasm(
+                        binary, sha, f"{src.stem}-{opt}",
+                        on_progress=on_progress,
+                    )
+                )
+                names = list(src_fns)
+                with out_path.open("a") as f:
+                    for rec in recs:
+                        if rec.is_external or rec.is_thunk or not rec.decompiled:
+                            continue
+                        key = rec.name.lstrip("_")
+                        body = src_fns.get(key)
+                        if body is None:
+                            stats["unmatched"].setdefault(
+                                f"{src.name}:{opt}", []
+                            ).append(rec.name)
+                            continue
+                        others = [n for n in names if n != key]
+                        neg = _src_doc(
+                            others[0], src_sigs[others[0]],
+                            src_fns[others[0]],
+                        ) if others else ""
+                        f.write(
+                            json.dumps(
+                                {
+                                    "anchor": build_embed_text(rec),
+                                    "positive": _src_doc(
+                                        key, src_sigs[key], body),
+                                    "negative": neg,
                                     "meta": {
                                         "src": str(src), "opt": opt,
                                         "func": key, "addr": rec.address,
