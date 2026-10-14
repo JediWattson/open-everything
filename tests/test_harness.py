@@ -296,6 +296,61 @@ def test_lift_escalates_only_on_defects(tmp_path):
     assert syms["clean"]["unresolved"] == [] and syms["clean"]["dropped"] == []
 
 
+def test_names_propagate_from_clone_catalog(tmp_path):
+    import json as _json
+
+    from openeverything.names import propagate_names
+
+    cat = tmp_path / "clones.jsonl"
+    cat.write_text("\n".join(_json.dumps(r) for r in [
+        # fpd=0 watch pair = identical structure — legitimate donor even
+        # though name-token drag kept cosine below `similar`
+        {"a_bin": "named", "a_name": "_score_password", "a_addr": "0x1",
+         "b_bin": "stripped", "b_name": "FUN_10000050c", "b_addr": "0x2",
+         "sim": 0.81, "fpd": 0.0, "verdict": "watch",
+         "a_asm": "", "b_asm": ""},
+        # high-fpd watch = structural coincidence, not a donor
+        {"a_bin": "named", "a_name": "_other", "a_addr": "0x3",
+         "b_bin": "stripped", "b_name": "FUN_999", "b_addr": "0x9",
+         "sim": 0.85, "fpd": 0.9, "verdict": "watch",
+         "a_asm": "", "b_asm": ""},
+        # named→named pair: nothing to propagate
+        {"a_bin": "named", "a_name": "_x", "a_addr": "0x4",
+         "b_bin": "named2", "b_name": "_y", "b_addr": "0x5",
+         "sim": 0.99, "fpd": 0.0, "verdict": "same",
+         "a_asm": "", "b_asm": ""},
+    ]))
+    props = propagate_names(cat, "stripped")
+    assert props["FUN_10000050c"]["name"] == "score_password"
+    assert props["FUN_10000050c"]["via"] == "named:_score_password"
+    assert "FUN_999" not in props
+
+
+def test_lift_applies_propagated_names(tmp_path):
+    from openeverything.lift import lift_binary
+
+    store = Store(tmp_path / "db")
+    store.add_functions([
+        _rec("FUN_10000050c", sha="s",
+             body="int FUN_10000050c(void){ return 0; }"),
+    ])
+
+    def chat(msgs, tools=None, temp=None):
+        # model keeps the anonymous token as the name
+        yield ('{"name": "FUN_10000050c",'
+               ' "signature": "int FUN_10000050c(void)",'
+               ' "code": "int FUN_10000050c(void){ return 0; }"}')
+
+    names = {"FUN_10000050c": {"name": "score_password",
+                               "via": "named:_score_password"}}
+    _, syms = lift_binary(store, "s", "bin", chat, tmp_path / "o",
+                          names=names)
+    s = syms["FUN_10000050c"]
+    assert s["name"] == "score_password"
+    assert s["signature"] == "int score_password(void)"
+    assert s["via"] == "named:_score_password"
+
+
 def test_uleb128_decode():
     from openeverything.disasm import _uleb128
 

@@ -144,6 +144,14 @@ class Store:
     def register_binary(
         self, sha256: str, name: str, path: str, n_functions: int
     ) -> None:
+        # A rebuilt binary at the same path supersedes its old sha — drop
+        # stale registrations (and their function rows) so name lookups
+        # can't resolve to ghost entries.
+        for stale in (
+            b["binary_sha256"] for b in self.list_binaries()
+            if b["path"] == path and b["binary_sha256"] != sha256
+        ):
+            self.drop_binary(stale)
         row = {
             "binary_sha256": sha256,
             "binary_name": name,

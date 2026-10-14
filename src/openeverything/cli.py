@@ -304,8 +304,12 @@ def lift(
     llm_model: str | None = typer.Option(None, "--llm"),
     clustered: bool = typer.Option(False, "--clustered", help="Cluster-aware module lift (arch v2)"),
     threshold: float = typer.Option(0.25, "-t", help="Cluster merge threshold (clustered mode)"),
+    names: Path | None = typer.Option(
+        None, "--names", help="names.json from `oe names` — clone-propagated symbol names"),
 ):
     """Lift all functions to coherent C++ via a shared symbol table."""
+    import json
+
     from . import llm
     from .lift import lift_binary, lift_binary_clustered
 
@@ -343,6 +347,7 @@ def lift(
             limit=limit,
             on_progress=on_prog,
             embed=embed,
+            names=json.loads(names.read_text()) if names else None,
             **kw,
         )
     failed = sum(1 for s in symbols.values() if s["failed"])
@@ -350,6 +355,36 @@ def lift(
         f"[green]ok[/] {len(symbols)} functions → {out_dir} "
         f"({failed} fell back to raw decompile)"
     )
+
+
+@app.command()
+def names(
+    binary: str,
+    clones: Path = typer.Option(
+        Path("emb/clones.jsonl"), "--clones", help="clone catalog from mine_clones"),
+    out: Path | None = typer.Option(
+        None, "--out", "-o", help="Write name map JSON (default: print table)"),
+):
+    """Propose names for FUN_* from clone-catalog matches in other binaries."""
+    import json
+
+    from .names import propagate_names
+
+    store = Store()
+    sha = _resolve_sha(store, binary)
+    bin_name = next(b["binary_name"] for b in store.list_binaries()
+                    if b["binary_sha256"] == sha)
+    proposals = propagate_names(clones, bin_name, store=store)
+    if out:
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(json.dumps(proposals, indent=1) + "\n")
+        console.print(f"[green]ok[/] {len(proposals)} names → {out}")
+    else:
+        for fun, p in sorted(proposals.items()):
+            console.print(
+                f"{fun} → [bold]{p['name']}[/] "
+                f"(via {p['via']}, sim {p['sim']:.2f}, fpd {p['fpd']:.2f})"
+            )
 
 
 @app.command()

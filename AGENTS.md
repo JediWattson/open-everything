@@ -138,6 +138,15 @@ oe clusters <bin> [-t 0.25] [--label] [--out map.json]
 oe clusters <bin> --graph           # call-graph communities instead — exact,
                                     # no embedder needed (shared-callee signal)
 oe splice <target> --from <donor> --seed <fn>...   # graft donor subsystem into target
+oe names <binary> [-o names.json]   # propose FUN_* names from clone-catalog
+                                    #   twins (same/similar verdicts, plus
+                                    #   watch pairs at fpd<=0.1 — identical
+                                    #   structure whose FUN_* token alone
+                                    #   drags cosine below `similar`)
+oe lift <binary> --names names.json # propagate donor name+signature into the
+                                    #   lift; evidence-backed clone names win
+                                    #   over model-guessed names (guess kept
+                                    #   in report as model_name)
 oe mksft <src.c>... [-o sft/pairs.jsonl] [--opts O0,O1,O2,Os]
                                     # SFT pair gen: compile→decompile→align
 oe mkemb <binary>... [-o emb/pairs.jsonl]     # embedder SFT: community

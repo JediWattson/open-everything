@@ -47,13 +47,19 @@ class MachO:
     def __init__(self, path: Path):
         raw = Path(path).read_bytes()
         (magic_be,) = struct.unpack_from(">I", raw, 0)
+        self.arch = "arm64"
         if magic_be == 0xCAFEBABE:  # fat — find the arm64 slice
             (nfat,) = struct.unpack_from(">I", raw, 4)
             for i in range(nfat):
-                cputype, _sub, s_off, size, _al = struct.unpack_from(
+                cputype, sub, s_off, size, _al = struct.unpack_from(
                     ">IIIII", raw, 8 + i * 20
                 )
                 if cputype == 0x0100000C:  # CPU_TYPE_ARM64
+                    # CPU_SUBTYPE_ARM64E=2 — otool names it 'arm64e', and
+                    # '-arch arm64' will NOT match it on arm64e-only files
+                    self.arch = (
+                        "arm64e" if sub & ~0x80000000 == 2 else "arm64"
+                    )
                     raw = raw[s_off : s_off + size]
                     break
             else:
@@ -62,6 +68,9 @@ class MachO:
         (magic,) = struct.unpack_from("<I", self.raw, 0)
         if magic != 0xFEEDFACF:
             raise ValueError("not a 64-bit Mach-O")
+        (sub,) = struct.unpack_from("<I", self.raw, 8)
+        if sub & ~0x80000000 == 2:
+            self.arch = "arm64e"
 
         (ncmds,) = struct.unpack_from("<I", self.raw, 16)
         self.text_seg_base = 0
@@ -210,11 +219,12 @@ def _fn_strings(mo: MachO, body_ins: list[str]) -> list[str]:
 
 
 def disasm_text(
-    binary: Path, symbols: dict[int, str] | None = None
+    binary: Path, symbols: dict[int, str] | None = None,
+    arch: str = "arm64",
 ) -> dict[int, str]:
     """arm64 addr -> instruction, resolving otool's named branch targets."""
     out = subprocess.run(
-        ["otool", "-arch", "arm64", "-tv", str(binary)],
+        ["otool", "-arch", arch, "-tv", str(binary)],
         capture_output=True, text=True, check=True,
     ).stdout
     insns: dict[int, str] = {}
@@ -259,7 +269,7 @@ def extract_disasm(
 ) -> Iterator[FunctionRecord]:
     """Ghidra-free function records: boundaries + asm, no decompile."""
     mo = MachO(binary)
-    insns = disasm_text(binary, mo.symbols)
+    insns = disasm_text(binary, mo.symbols, getattr(mo, "arch", "arm64"))
     insn_addrs = sorted(insns)
     stub_by_addr = dict(mo.stub_functions())
     # `; symbol stub for: _name` comments name stub call targets directly

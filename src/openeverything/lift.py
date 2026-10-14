@@ -590,6 +590,7 @@ def lift_binary(
     limit: int = 0,
     on_progress=None,
     embed=None,
+    names: dict | None = None,
 ) -> tuple[Path, dict]:
     """Lift every decompiled function in `sha256`. Returns (out_dir, symbols)."""
     rows = [
@@ -729,16 +730,48 @@ def lift_binary(
             code,
         )
 
+    # Clone-propagated names: an evidence-backed clone name beats a
+    # retained FUN_* token. Applied before the rename pass so callers see
+    # them too.
+    if names:
+        for fn in order:
+            orig = fn["name"]
+            s = symbols[orig]
+            p = names.get(orig)
+            # an fpd≈0/similar clone name is evidence; a model name is a
+            # guess — evidence wins even when the model emitted a real name
+            if not p or s["name"] == p["name"]:
+                continue
+            taken = {x["name"] for x in symbols.values() if x is not s}
+            new = p["name"]
+            while new in taken:
+                new += "_"
+            s["signature"] = (
+                p.get("signature")
+                or _rename_signature(s["signature"], s["name"], new)
+            )
+            s["model_name"] = s["name"]
+            s["name"] = new
+            s["via"] = p["via"]
+
     # Post-pass: rewrite every lifted original name anywhere it appears in
     # emitted code — covers LLM non-compliance and non-callee references
     # (function pointers, thunks) the per-function prompt can't see.
     renames = {
         orig: s["name"] for orig, s in symbols.items() if s["name"] != orig
     }
+    # model-emitted names overridden by propagated ones must rewrite too —
+    # the body/callers contain `process_data`, not the FUN_ token
+    renames.update(
+        (s["model_name"], s["name"])
+        for s in symbols.values()
+        if s.get("model_name")
+    )
     for fn in order:
         code = symbols[fn["name"]]["code"]
         symbols[fn["name"]]["code"] = _rewrite_names(
-            code, {orig: new for orig, new in renames.items() if orig != fn["name"]},
+            code, {orig: new for orig, new in renames.items()
+                   if orig != fn["name"]},
             {r["name"] for r in uniq} | base_known,
         )
 
@@ -903,6 +936,7 @@ def lift_binary_clustered(
     limit: int = 0,
     on_progress=None,
     embed=None,
+    names: dict | None = None,
 ) -> tuple[Path, dict]:
     """Clustered whole-binary lift. Returns (out_dir, symbols)."""
     from .cluster import cluster_functions
@@ -1070,10 +1104,34 @@ def lift_binary_clustered(
             s["code"],
         )
 
+    # clone-propagated names — evidence-backed names win over model
+    # guesses (before rename pass so callers see them)
+    if names:
+        for orig, s in symbols.items():
+            p = names.get(orig)
+            if not p or s["name"] == p["name"]:
+                continue
+            taken = {x["name"] for x in symbols.values() if x is not s}
+            new = p["name"]
+            while new in taken:
+                new += "_"
+            s["signature"] = (
+                p.get("signature")
+                or _rename_signature(s["signature"], s["name"], new)
+            )
+            s["model_name"] = s["name"]
+            s["name"] = new
+            s["via"] = p["via"]
+
     # post-pass rename (same as flat lift)
     renames = {
         orig: s["name"] for orig, s in symbols.items() if s["name"] != orig
     }
+    renames.update(
+        (s["model_name"], s["name"])
+        for s in symbols.values()
+        if s.get("model_name")
+    )
     for orig, s in symbols.items():
         code = s["code"]
         s["code"] = _rewrite_names(
