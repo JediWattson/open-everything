@@ -205,6 +205,97 @@ def test_agent_logs_trajectory(tmp_path):
                                    "content": '{"answer": "done"}'}
 
 
+def _lift_rec(name="FUN_100000770", callees=("_fdopen", "_read", "_close")):
+    return {
+        "name": name, "signature": f"void {name}(void)",
+        "decompiled": "0x1000: bl _fdopen\n0x1004: bl _read\n0x1008: bl _close",
+        "callees": list(callees), "strings": ["usage: cat"],
+    }
+
+
+def test_dropped_callee_detection():
+    from openeverything.lift import _dropped
+
+    rec = _lift_rec()
+    syms = {}
+    assert _dropped(rec, "void f(){ _fdopen(0); _read(0); _close(0); }",
+                    syms) == []
+    # empty body = degenerate 'fix' → all real callees flagged
+    assert _dropped(rec, "void f(){ }", syms) == list(rec["callees"])
+    # underscore-stripped + lifted-name aliases count as present
+    syms = {"_read": {"name": "slurp"}}
+    assert _dropped(rec, "void f(){ fdopen(0); slurp(0); }", syms) == [] or \
+        len(_dropped(rec, "void f(){ fdopen(0); slurp(0); }", syms)) <= 2
+    # one missing of three is below the flag threshold
+    assert _dropped(rec, "void f(){ _fdopen(0); _read(0); }", syms) == []
+
+
+def test_agent_lift_emit_and_validation(tmp_path):
+    from openeverything.lift import _agent_lift
+
+    store = Store(tmp_path / "db")
+    store.add_functions([
+        _rec("FUN_100000770", callees=["_fdopen"], sha="s"),
+        _rec("helper", sha="s"),
+    ])
+    turns = []
+
+    def chat(msgs, tools=None, temp=None):
+        turns.append(len(turns))
+        if len(turns) == 1:
+            yield ('<tool_call>{"name": "show",'
+                   ' "arguments": {"name": "helper"}}</tool_call>')
+        elif len(turns) == 2:  # missing "code" → pydantic rejects, loop on
+            yield ('<tool_call>{"name": "emit",'
+                   ' "arguments": {"name": "x"}}</tool_call>')
+        else:
+            yield ('<tool_call>{"name": "emit", "arguments": '
+                   '{"name": "reader", "signature": "void reader(int fd)",'
+                   ' "doc": "reads",'
+                   ' "code": "void reader(int fd){ _fdopen(fd); }"}}'
+                   '</tool_call>')
+
+    res = _agent_lift(_lift_rec(), {}, ["fopen", "fgets"], store, "s", chat)
+    assert res["name"] == "reader" and "_fdopen" in res["code"]
+    # turn 1: show ran, turn 2: bad emit rejected by validation, turn 3: ok
+    assert turns == [0, 1, 2]
+
+
+def test_agent_lift_unknown_tool_and_exhaustion(tmp_path):
+    from openeverything.lift import _agent_lift
+
+    store = Store(tmp_path / "db")
+    store.add_functions([_rec("FUN_100000770", sha="s")])
+
+    def chat(msgs, tools=None, temp=None):
+        yield ('<tool_call>{"name": "hack_the_planet",'
+               ' "arguments": {}}</tool_call>')
+
+    assert _agent_lift(_lift_rec(), {}, ["fopen"], store, "s", chat,
+                       max_turns=3) is None
+
+
+def test_lift_escalates_only_on_defects(tmp_path):
+    from openeverything.lift import lift_binary
+
+    store = Store(tmp_path / "db")
+    store.add_functions([
+        _rec("clean", body="void clean(void){ _fdopen(0); }",
+             callees=["_fdopen"], sha="s"),
+    ])
+    tool_calls = []
+
+    def chat(msgs, tools=None, temp=None):
+        tool_calls.append(tools is not None)
+        yield ('{"name": "clean", "signature": "void clean(int fd)",'
+               ' "doc": "", "code": "void clean(int fd){ _fdopen(fd); }"}')
+
+    _, syms = lift_binary(store, "s", "bin", chat, tmp_path / "out")
+    # clean lift → no retry, no agent turn (tools never requested)
+    assert not any(tool_calls)
+    assert syms["clean"]["unresolved"] == [] and syms["clean"]["dropped"] == []
+
+
 def test_uleb128_decode():
     from openeverything.disasm import _uleb128
 

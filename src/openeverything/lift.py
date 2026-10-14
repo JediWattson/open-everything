@@ -13,6 +13,8 @@ import json
 import re
 from pathlib import Path
 
+from pydantic import BaseModel, ValidationError
+
 from .store import Store
 
 _SYSTEM = """You rewrite decompiled binary functions as clean C++.
@@ -78,6 +80,22 @@ def _unresolved(code: str, known: set[str], self_name: str) -> list[str]:
     return sorted(called - known - {self_name})
 
 
+def _dropped(rec: dict, code: str, symbols: dict) -> list[str]:
+    """Real callees that vanished from the emitted code — the degenerate
+    'fix' for confabulation is deleting every call, which passes
+    _unresolved but loses the function. Flag when most callees dropped.
+    A callee counts as present under its raw name, its lifted name, or
+    its underscore-stripped variant."""
+    bare = re.sub(r'"(?:[^"\\]|\\.)*"', '""', code)
+    called = set(re.findall(r"\b([a-zA-Z_]\w*)\s*\(", bare))
+    dropped = []
+    for c in rec["callees"]:
+        aliases = {c, c.lstrip("_"), symbols.get(c, {}).get("name", c)}
+        if not aliases & called:
+            dropped.append(c)
+    return dropped if len(dropped) >= max(2, len(rec["callees"]) - 1) else []
+
+
 def _extract_json(text: str) -> dict | None:
     dec = json.JSONDecoder()
     for i, ch in enumerate(text):
@@ -90,6 +108,153 @@ def _extract_json(text: str) -> dict | None:
         if isinstance(obj, dict) and "code" in obj:
             return obj
     return None
+
+
+# --- tier-3 lift: constrained mini-agent for confabulating functions ---
+#
+# Tools are deliberately tiny: the only thing the flat lift lacks is the
+# binary's real name surface, so the agent can `functions`/`show` to look
+# names up, then MUST finish by calling `emit` — a pydantic-validated
+# tool call, not free-form JSON, so the output shape is enforced.
+
+_LIFT_AGENT_SYSTEM = """You rewrite ONE decompiled function as clean C++.
+
+Call a tool by emitting exactly one block per turn, nothing else:
+<tool_call>
+{"name": "<tool>", "arguments": {...}}
+</tool_call>
+
+Tools:
+  functions()        — list every function name in this binary
+  show(name)         — signature, callees, strings, body of one function
+  emit(name, signature, doc, code)
+                     — your final answer; code = complete C++ function
+
+Rules:
+- Only call names you saw via functions()/show() or that were given as
+  signatures — anything else keeps its original FUN_* token.
+- When confident, finish with emit(). Do not narrate."""
+
+_AGENT_SCHEMAS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "functions",
+            "description": "list every function name in this binary",
+            "parameters": {"type": "object", "properties": {}},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "show",
+            "description": "signature, callees, strings, body of one function",
+            "parameters": {
+                "type": "object",
+                "properties": {"name": {"type": "string"}},
+                "required": ["name"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "emit",
+            "description": "final lifted function (name, signature, doc, code)",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string"},
+                    "signature": {"type": "string"},
+                    "doc": {"type": "string"},
+                    "code": {"type": "string"},
+                },
+                "required": ["name", "signature", "code"],
+            },
+        },
+    },
+]
+
+
+def _agent_lift(
+    rec: dict,
+    symbols: dict,
+    bad: list[str],
+    store: Store,
+    sha256: str,
+    chat,
+    max_turns: int = 6,
+) -> dict | None:
+    """Tool-using lift for functions the flat pass confabulates on.
+    Returns {name, signature, doc, code} or None if it never emits."""
+    from .agent import _extract_action  # same <tool_call>/json parser
+
+    def functions() -> str:
+        names = [
+            r["name"]
+            for r in store.list_functions(sha256, limit=100000)
+        ]
+        return json.dumps(names)
+
+    def show(name: str) -> str:
+        row = store.get_function(name, sha256)
+        if not row:
+            return f"no function {name!r}"
+        return json.dumps({
+            "name": row["name"], "signature": row["signature"],
+            "callees": row["callees"], "strings": row["strings"][:15],
+            "decompiled": row["decompiled"][:3000],
+        })
+
+    msgs = _lift_prompt(rec, symbols)
+    msgs[0] = {"role": "system", "content": _LIFT_AGENT_SYSTEM}
+    msgs[1]["content"] += (
+        "\n\nYour previous attempt mishandled these names — invented calls "
+        f"or dropped real callees: {', '.join(bad)}. Use functions()/show() "
+        "to check real names before emitting, and keep every callee the "
+        "assembly actually calls."
+    )
+    for _ in range(max_turns):
+        raw = "".join(chat(msgs, tools=_AGENT_SCHEMAS, temp=0.0))
+        action = _extract_action(raw)
+        if action is None:
+            msgs += [{"role": "assistant", "content": raw},
+                     {"role": "user", "content":
+                      "Emit exactly one <tool_call> block."}]
+            continue
+        name = action.get("tool", "")
+        args = action.get("args") or {}
+        if name == "emit":
+            try:
+                return _LiftEmit.model_validate(args).model_dump()
+            except ValidationError as e:
+                msgs += [{"role": "assistant", "content": raw},
+                         {"role": "user", "content":
+                          f"emit rejected ({e.errors()[0]['msg']}) — retry."}]
+                continue
+        if name == "functions":
+            obs = functions()
+        elif name == "show":
+            try:
+                obs = show(_NameArg.model_validate(args).name)
+            except ValidationError as e:
+                obs = f"invalid show args: {e.errors()[0]['msg']}"
+        else:
+            obs = f"unknown tool {name!r} — use functions/show/emit"
+        msgs += [{"role": "assistant", "content": raw},
+                 {"role": "user", "content": f"OBSERVATION: {obs}"}]
+    return None
+
+
+class _NameArg(BaseModel):
+    name: str
+
+
+class _LiftEmit(BaseModel):
+    name: str
+    signature: str
+    doc: str = ""
+    code: str
 
 
 def _lift_prompt(rec: dict, symbols: dict) -> list[dict]:
@@ -163,27 +328,54 @@ def lift_binary(
         # Confabulation check + one corrective retry: code calling a name
         # that isn't a real callee gets bounced back with the offenders.
         known = base_known | {s["name"] for s in symbols.values()}
-        bad = _unresolved(code, known, new_name)
-        if "code" in res and bad:
+        # defects = invented calls + deleted real callees (an empty body
+        # 'fixes' confabulation by deleting everything — count both)
+        def defects(c: str, n: str) -> int:
+            return (len(_unresolved(c, known, n))
+                    + len(_dropped(rec, c, symbols)))
+
+        n_bad = defects(code, new_name)
+        if "code" in res and n_bad:
+            bad = _unresolved(code, known, new_name)
+            dropped = _dropped(rec, code, symbols)
+            why = []
+            if bad:
+                why.append(f"called functions that do not exist: {', '.join(bad)}")
+            if dropped:
+                why.append(f"dropped real callees: {', '.join(dropped)}")
             msgs = _lift_prompt(rec, symbols) + [{
                 "role": "user",
                 "content": (
-                    "Your code called functions that do not exist in this "
-                    f"binary: {', '.join(bad)}. Only call names from the "
-                    "callee list or the given signatures — anything else "
-                    "must keep its original FUN_* token. Emit the corrected "
-                    "JSON object."
+                    "Your code " + "; ".join(why) + ". Only call names from "
+                    "the callee list or the given signatures, and keep every "
+                    "real callee — anything else must keep its original "
+                    "FUN_* token. Emit the corrected JSON object."
                 ),
             }]
             r2 = _extract_json("".join(chat(msgs)))
             if r2 and "code" in r2:
-                # adopt the retry only if it strictly reduces unresolved
-                # calls — a worse rewrite (e.g. asm-as-calls) gets dropped
+                # adopt the retry only if it strictly reduces defects —
+                # a worse rewrite (e.g. asm-as-calls) gets dropped
                 n2 = r2.get("name") or new_name
-                bad2 = _unresolved(r2["code"], known, n2)
-                if len(bad2) < len(bad):
+                if defects(r2["code"], n2) < n_bad:
                     res, code = r2, r2["code"]
                     new_name, signature = n2, r2.get("signature") or signature
+                    n_bad = defects(code, new_name)
+            # tier 3: still defective → mini-agent looks names up via
+            # functions()/show() then emits a validated lift
+            if "code" in res and n_bad:
+                agent_res = _agent_lift(
+                    rec, symbols,
+                    _unresolved(code, known, new_name)
+                    + _dropped(rec, code, symbols),
+                    store, sha256, chat,
+                )
+                if agent_res:
+                    a_new = agent_res.get("name") or new_name
+                    if defects(agent_res["code"], a_new) < n_bad:
+                        res, code = agent_res, agent_res["code"]
+                        new_name = a_new
+                        signature = agent_res.get("signature") or signature
         if new_name in used_names:
             n = 2
             while f"{new_name}_{n}" in used_names:
@@ -232,6 +424,12 @@ def lift_binary(
     for fn in order:
         s = symbols[fn["name"]]
         s["unresolved"] = _unresolved(s["code"], known, s["name"])
+        # raw-asm fallbacks reference addresses, not names — dropped is
+        # meaningless there, and a failed row is already honest
+        s["dropped"] = [] if s["failed"] else _dropped(
+            fn, s["code"],
+            {k: {"name": v["name"]} for k, v in symbols.items()},
+        )
 
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -445,26 +643,53 @@ def lift_binary_clustered(
             signature = r2.get("signature") or rec["signature"]
             code = r2.get("code") or rec["decompiled"]
             known = base_known | {s["name"] for s in symbols.values()}
-            bad = _unresolved(code, known, new_name)
-            if "code" in r2 and bad:
+
+            def defects(c: str, n: str) -> int:
+                return (len(_unresolved(c, known, n))
+                        + len(_dropped(rec, c, symbols)))
+
+            n_bad = defects(code, new_name)
+            if "code" in r2 and n_bad:
+                bad = _unresolved(code, known, new_name)
+                dropped = _dropped(rec, code, symbols)
+                why = []
+                if bad:
+                    why.append(
+                        f"called functions that do not exist: {', '.join(bad)}"
+                    )
+                if dropped:
+                    why.append(f"dropped real callees: {', '.join(dropped)}")
                 msgs = _lift_prompt_ctx(rec, symbols, module) + [{
                     "role": "user",
                     "content": (
-                        "Your code called functions that do not exist in "
-                        f"this binary: {', '.join(bad)}. Only call names "
-                        "from the callee list or the given signatures — "
-                        "anything else must keep its original FUN_* token. "
-                        "Emit the corrected JSON object."
+                        "Your code " + "; ".join(why) + ". Only call names "
+                        "from the callee list or the given signatures, and "
+                        "keep every real callee — anything else must keep "
+                        "its original FUN_* token. Emit the corrected JSON "
+                        "object."
                     ),
                 }]
                 r3 = _extract_json("".join(chat(msgs)))
                 if r3 and "code" in r3:
                     n3 = r3.get("name") or new_name
-                    bad3 = _unresolved(r3["code"], known, n3)
-                    if len(bad3) < len(bad):
+                    if defects(r3["code"], n3) < n_bad:
                         r2, code = r3, r3["code"]
                         new_name = n3
                         signature = r3.get("signature") or signature
+                        n_bad = defects(code, new_name)
+                if "code" in r2 and n_bad:
+                    agent_res = _agent_lift(
+                        rec, symbols,
+                        _unresolved(code, known, new_name)
+                        + _dropped(rec, code, symbols),
+                        store, sha256, chat,
+                    )
+                    if agent_res:
+                        a_new = agent_res.get("name") or new_name
+                        if defects(agent_res["code"], a_new) < n_bad:
+                            r2, code = agent_res, agent_res["code"]
+                            new_name = a_new
+                            signature = agent_res.get("signature") or signature
             if new_name in used_names:
                 n = 2
                 while f"{new_name}_{n}" in used_names:
