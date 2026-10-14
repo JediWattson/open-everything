@@ -33,8 +33,13 @@ def _mlx_chat(
     global _mlx_cache
     from mlx_lm import generate, load, stream_generate
 
-    if not _mlx_cache or _mlx_cache[0] != model_name:
-        _mlx_cache = (model_name, *load(model_name))
+    # OE_LLM_ADAPTER points at a trained LoRA/DoRA adapter dir — the
+    # (model, adapter) pair is the cache key so switching adapters reloads.
+    adapter = os.environ.get("OE_LLM_ADAPTER") or None
+    if not _mlx_cache or _mlx_cache[0] != (model_name, adapter):
+        _mlx_cache = (
+            (model_name, adapter), *load(model_name, adapter_path=adapter)
+        )
     _, model, tokenizer = _mlx_cache
     prompt = tokenizer.apply_chat_template(
         messages, tools=tools, tokenize=False, add_generation_prompt=True

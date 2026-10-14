@@ -157,7 +157,16 @@ oe lift <binary> --names names.json # propagate donor name+signature into the
                                     #   over model-guessed names (guess kept
                                     #   in report as model_name)
 oe mksft <src.c>... [-o sft/pairs.jsonl] [--opts O0,O1,O2,Os]
-                                    # SFT pair gen: compile→decompile→align
+                                    # SFT pair gen: compile→disasm→align,
+                                    #   lift-format {messages} pairs
+                                    #   (--frontend ghidra for pseudocode)
+oe train sft/pairs.jsonl [-a sft/adapters/lift] [--iters N] [--max-seq 4096]
+                                    # LoRA-train the lifter via mlx_lm lora;
+                                    #   pairs over max-seq are dropped (a
+                                    #   truncated target = zero masked-prompt
+                                    #   loss tokens → nan)
+oe lift <bin>                       # with OE_LLM_ADAPTER=<adapter dir> to
+                                    #   apply a trained adapter at load
 oe mkemb <binary>... [-o emb/pairs.jsonl]     # embedder SFT: community
                                     # {anchor,positive,negative} triplets
 oe mksft <src.c>... --emb [-o out.jsonl]      # embedder SFT: compile → disasm

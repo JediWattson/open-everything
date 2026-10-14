@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 from pathlib import Path
 
 import typer
@@ -453,8 +454,9 @@ def mksft(
     opts: str = typer.Option("O0,O1,O2,Os", "--opts", help="Optimization levels"),
     emb: bool = typer.Option(False, "--emb", help="Emit {anchor,positive,negative} asm↔source triplets (embedder SFT)"),
     ident: bool = typer.Option(False, "--ident", help="Emit asm@optA↔asm@optB identity pairs for the same source function"),
+    frontend: str = typer.Option("disasm", "--frontend", help="Extractor for lift pairs: disasm (otool, default) or ghidra"),
 ):
-    """Generate (decompiled, source) SFT pairs by compiling C sources."""
+    """Generate (disassembled, source) SFT pairs by compiling C sources."""
     from .sft import (
         generate_emb_pairs, generate_identity_pairs, generate_pairs,
     )
@@ -476,11 +478,18 @@ def mksft(
     gen = (generate_identity_pairs if ident
            else generate_emb_pairs if emb
            else generate_pairs)
-    stats = gen(
-        srcs, out, tuple(opts.split(",")),
-        on_progress=lambda i, n, name: err.print(
-            f"[dim]{i}/{n} {name}[/]"),
-    )
+    if gen is generate_pairs:
+        stats = gen(
+            srcs, out, tuple(opts.split(",")), frontend=frontend,
+            on_progress=lambda i, n, name: err.print(
+                f"[dim]{i}/{n} {name}[/]"),
+        )
+    else:
+        stats = gen(
+            srcs, out, tuple(opts.split(",")),
+            on_progress=lambda i, n, name: err.print(
+                f"[dim]{i}/{n} {name}[/]"),
+        )
     console.print(
         f"[green]ok[/] {stats['pairs']} pairs → {out} "
         f"({stats['binaries']} binaries from {stats['files']} files)"
@@ -490,6 +499,85 @@ def mksft(
             err.print(f"  unmatched in {k}: {names}")
     for k, n in stats.get("funcs", {}).items():
         console.print(f"[dim]{k}: {n} fns in >=2 opt builds[/]")
+
+
+@app.command()
+def train(
+    pairs: Path,
+    model: str = typer.Option("", "-m", "--model",
+                              help="Base model (default: OE_LLM_MODEL or the "
+                              "config lifter model)"),
+    adapter_out: Path = typer.Option(Path("sft/adapters/lift"),
+                                     "--adapter-out", "-a"),
+    iters: int = typer.Option(600, "--iters"),
+    layers: int = typer.Option(8, "--layers",
+                               help="LoRA on last N transformer layers"),
+    batch: int = typer.Option(1, "--batch-size"),
+    val_frac: float = typer.Option(0.1, "--val-frac"),
+    max_seq: int = typer.Option(4096, "--max-seq",
+                                help="Pairs whose text exceeds ~3.5 chars/"
+                                "token of this are dropped — a truncated "
+                                "target teaches broken JSON (and masked-"
+                                "prompt loss over zero tokens → nan)"),
+):
+    """LoRA-train the lifter on mksft pairs → adapter for OE_LLM_ADAPTER."""
+    import random
+    import subprocess
+    import tempfile
+
+    from .llm import _DEFAULT_MLX_MODEL
+
+    model = model or os.environ.get("OE_LLM_MODEL") or _DEFAULT_MLX_MODEL
+
+    rows = [l for l in Path(pairs).read_text().splitlines() if l.strip()]
+
+    # Tokenize each pair with the model's own chat template — a pair that
+    # exceeds max_seq truncates mid-target (teaches broken JSON) and, under
+    # --mask-prompt, can leave zero target tokens → nan loss.
+    from transformers import AutoTokenizer
+
+    tok = AutoTokenizer.from_pretrained(model)
+
+    def n_tokens(l: str) -> int:
+        try:
+            msgs = json.loads(l)["messages"]
+            rendered = tok.apply_chat_template(msgs, tokenize=False)
+            return len(tok(rendered).input_ids)
+        except Exception:
+            return max_seq + 1
+
+    kept = [l for l in rows if n_tokens(l) <= max_seq]
+    if len(kept) != len(rows):
+        err.print(f"[dim]dropped {len(rows) - len(kept)} pairs "
+                  f"over {max_seq} tokens[/]")
+    rows = kept
+    if len(rows) < 10:
+        err.print(f"need >=10 pairs, got {len(rows)}")
+        raise typer.Exit(1)
+    random.Random(0).shuffle(rows)
+    n_val = max(1, int(len(rows) * val_frac))
+    split = {"valid.jsonl": rows[:n_val], "train.jsonl": rows[n_val:]}
+
+    adapter_out = Path(adapter_out)
+    adapter_out.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory() as td:
+        for fn, chunk in split.items():
+            Path(td, fn).write_text("\n".join(chunk) + "\n")
+        console.print(
+            f"[dim]{len(rows) - n_val} train / {n_val} val pairs · "
+            f"{model} · {iters} iters · last {layers} layers[/]")
+        cp = subprocess.run([
+            sys.executable, "-m", "mlx_lm", "lora",
+            "--train", "--model", model, "--data", td,
+            "--adapter-path", str(adapter_out), "--iters", str(iters),
+            "--num-layers", str(layers), "--batch-size", str(batch),
+            "--max-seq-length", str(max_seq),
+            "--mask-prompt", "--grad-checkpoint",
+        ])
+    if cp.returncode != 0:
+        raise typer.Exit(cp.returncode)
+    console.print(f"[green]ok[/] adapter → {adapter_out}")
+    console.print(f"  lift with it: OE_LLM_ADAPTER={adapter_out} oe lift <bin>")
 
 
 @app.command()

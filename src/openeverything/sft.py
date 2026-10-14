@@ -88,7 +88,13 @@ def _user_prompt(rec: dict, src_sigs: dict[str, str]) -> str:
         )
     if rec.strings:
         parts.append("strings: " + " | ".join(rec.strings[:10]))
-    parts += ["decompiled:", "```c", rec.decompiled, "```"]
+    is_asm = rec.decompiled.startswith("0x")
+    parts += [
+        "disassembled:" if is_asm else "decompiled:",
+        "```asm" if is_asm else "```c",
+        rec.decompiled,
+        "```",
+    ]
     return "\n".join(parts)
 
 
@@ -96,6 +102,7 @@ def generate_pairs(
     sources: list[Path],
     out_path: Path,
     opts: tuple[str, ...] = _DEFAULT_OPTS,
+    frontend: str = "disasm",
     on_progress=None,
 ) -> dict:
     """Compile→decompile→align each source; append pairs to out_path."""
@@ -108,10 +115,12 @@ def generate_pairs(
             src = Path(src)
             src_fns = source_functions(src)
             stats["files"] += 1
+            extract = extract_disasm if frontend == "disasm" else extract_functions
             for opt in opts:
                 binary = Path(td) / f"{src.stem}-{opt}"
                 cp = subprocess.run(
-                    ["cc", f"-{opt}", "-o", str(binary), str(src)],
+                    ["cc", f"-{opt}", *_BSD_STUBS,
+                     "-o", str(binary), str(src)],
                     capture_output=True, text=True,
                 )
                 if cp.returncode != 0:
@@ -119,7 +128,7 @@ def generate_pairs(
                 stats["binaries"] += 1
                 sha = hashlib.sha256(binary.read_bytes()).hexdigest()
                 recs = list(
-                    extract_functions(
+                    extract(
                         binary, sha, f"{src.stem}-{opt}",
                         on_progress=on_progress,
                     )
