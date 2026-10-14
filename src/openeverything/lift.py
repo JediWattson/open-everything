@@ -70,14 +70,71 @@ def _body_hash(body: str) -> str:
     return hashlib.sha1(" ".join(body.split()).encode()).hexdigest()
 
 
+def _source_name(name: str) -> str:
+    """An indexed overload identity may have an address absent from C++ code."""
+    return re.sub(r"__0x[0-9a-f]+(?:_\d+)?$", "", name).removeprefix("::")
+
+
+def _name_aliases(name: str) -> set[str]:
+    names = {name.removeprefix("::"), _source_name(name)}
+    return names | {name.lstrip("_") for name in names}
+
+
+def _called_names(code: str) -> set[str]:
+    bare = re.sub(r'"(?:[^"\\]|\\.)*"', '""', code)
+    return {
+        name.removeprefix("::")
+        for name in re.findall(
+            r"(?<![\w:])((?:::)?[a-zA-Z_]\w*(?:::[a-zA-Z_]\w*)*)\s*\(",
+            bare,
+        )
+    }
+
+
+def _replace_name(text: str, original: str, replacement: str, *, signature=False) -> str:
+    pattern = rf"(?<![\w:])(?:::)?{re.escape(original)}(?![\w:])"
+    if signature:
+        pattern += r"(?=\s*\()"
+    return re.sub(pattern, lambda match: replacement, text, count=1 if signature else 0)
+
+
+def _rename_signature(signature: str, original: str, replacement: str) -> str:
+    # Ghidra signatures omit the namespace as well as our overload suffix.
+    # This fallback applies only to this function's own declaration.
+    source = _source_name(original)
+    for candidate in dict.fromkeys((original, source, source.rsplit("::", 1)[-1])):
+        renamed = _replace_name(signature, candidate, replacement, signature=True)
+        if renamed != signature:
+            return renamed
+    return signature
+
+
+def _rewrite_names(code: str, renames: dict[str, str], identities: set[str]) -> str:
+    sources: dict[str, set[str]] = {}
+    for original in identities:
+        sources.setdefault(_source_name(original), set()).add(original)
+    replacements = dict(renames)
+    for original, renamed in renames.items():
+        source = _source_name(original)
+        # Multiple overload identities share one source spelling. Their
+        # individual call targets cannot be inferred by textual replacement.
+        if len(sources.get(source, ())) == 1:
+            replacements.setdefault(source, renamed)
+    if not replacements:
+        return code
+    pattern = r"(?<![\w:])(?:::)?(" + "|".join(
+        re.escape(name) for name in sorted(replacements, key=len, reverse=True)
+    ) + r")(?![\w:])"
+    return re.sub(pattern, lambda match: replacements[match.group(1)], code)
+
+
 def _unresolved(code: str, known: set[str], self_name: str) -> list[str]:
     """Callees in emitted code with no matching symbol — LLM confabulation
     detector: real callees come from the record, so invented names show up
     here immediately. String literals are stripped first — 'malloc()' inside
     \"malloc() failure\" is text, not a call."""
-    bare = re.sub(r'"(?:[^"\\]|\\.)*"', '""', code)
-    called = set(re.findall(r"\b([a-zA-Z_]\w*)\s*\(", bare))
-    return sorted(called - known - {self_name})
+    aliases = {alias for name in known | {self_name} for alias in _name_aliases(name)}
+    return sorted(_called_names(code) - aliases)
 
 
 def _dropped(rec: dict, code: str, symbols: dict) -> list[str]:
@@ -86,17 +143,24 @@ def _dropped(rec: dict, code: str, symbols: dict) -> list[str]:
     _unresolved but loses the function. Flag when most callees dropped.
     A callee counts as present under its raw name, its lifted name, or
     its underscore-stripped variant."""
-    bare = re.sub(r'"(?:[^"\\]|\\.)*"', '""', code)
-    called = set(re.findall(r"\b([a-zA-Z_]\w*)\s*\(", bare))
+    called = _called_names(code)
     dropped = []
     for c in rec["callees"]:
-        aliases = {c, c.lstrip("_"), symbols.get(c, {}).get("name", c)}
+        aliases = _name_aliases(c) | _name_aliases(symbols.get(c, {}).get("name", c))
         if not aliases & called:
             dropped.append(c)
     return dropped if len(dropped) >= max(2, len(rec["callees"]) - 1) else []
 
 
-def _extract_json(text: str) -> dict | None:
+def _extract_json(
+    text: str, *, required_fields: tuple[str, ...] = ("code",),
+    optional_fields: tuple[str, ...] = (),
+) -> dict | None:
+    """Find an object matching the caller's expected string fields.
+
+    Lift responses require code by default; metadata prompts opt into
+    their own fields so unrelated JSON cannot become a successful lift.
+    """
     dec = json.JSONDecoder()
     for i, ch in enumerate(text):
         if ch != "{":
@@ -105,7 +169,12 @@ def _extract_json(text: str) -> dict | None:
             obj, _ = dec.raw_decode(text[i:])
         except json.JSONDecodeError:
             continue
-        if isinstance(obj, dict) and "code" in obj:
+        if isinstance(obj, dict) and all(
+            isinstance(obj.get(field), str) for field in required_fields
+        ) and all(
+            field not in obj or isinstance(obj[field], str)
+            for field in optional_fields
+        ):
             return obj
     return None
 
@@ -356,7 +425,7 @@ def _region_roles(rec: dict, regions: list[dict], chat, embed) -> dict:
                 "Reply with JSON {\"label\": \"2-4 word role\"}.\n\n"
                 + sample)
             },
-        ], temp=0.0))) or {}
+        ], temp=0.0)), required_fields=("label",)) or {}
         for m in g:
             roles[m["name"]] = res.get("label") or "unlabeled"
     return roles
@@ -477,10 +546,10 @@ def _lift_regions(
             f"{'; '.join(rec['strings'][:5]) or 'no strings'}. Reply with "
             "JSON {\"name\": \"snake_case_name\", \"doc\": \"one line\"}."
         )},
-    ], temp=0.0))) or {}
+    ], temp=0.0)), required_fields=("name",), optional_fields=("doc",)) or {}
     name = re.sub(r"\W+", "_", res.get("name") or "").strip("_") \
         or rec["name"]
-    sig = rec["signature"].replace(rec["name"], name, 1)
+    sig = _rename_signature(rec["signature"], rec["name"], name)
     return {
         "name": name,
         "signature": sig,
@@ -609,6 +678,7 @@ def lift_binary(
                         res, code = agent_res, agent_res["code"]
                         new_name = a_new
                         signature = agent_res.get("signature") or signature
+                        n_bad = defects(code, new_name)
         if "code" not in res:
             # flat emit produced nothing parseable — the agent's emit()
             # is itself a lift attempt with tool feedback
@@ -635,8 +705,8 @@ def lift_binary(
             while f"{new_name}_{n}" in used_names:
                 n += 1
             renamed = f"{new_name}_{n}"
-            signature = signature.replace(new_name, renamed, 1)
-            code = re.sub(rf"\b{re.escape(new_name)}\b", renamed, code)
+            signature = _rename_signature(signature, new_name, renamed)
+            code = _replace_name(code, new_name, renamed)
             new_name = renamed
         used_names.add(new_name)
         symbols[rec["name"]] = {
@@ -667,10 +737,10 @@ def lift_binary(
     }
     for fn in order:
         code = symbols[fn["name"]]["code"]
-        for orig, new in renames.items():
-            if orig != fn["name"] and orig in code:
-                code = re.sub(rf"\b{re.escape(orig)}\b", new, code)
-        symbols[fn["name"]]["code"] = code
+        symbols[fn["name"]]["code"] = _rewrite_names(
+            code, {orig: new for orig, new in renames.items() if orig != fn["name"]},
+            {r["name"] for r in uniq} | base_known,
+        )
 
     # Unresolved call sites: names called in code that have no lifted symbol
     # or decl — mostly LLM-invented names; recorded as a quality metric.
@@ -876,7 +946,11 @@ def lift_binary_clustered(
     for ci, members in enumerate(groups):
         if limit and done_fns >= limit:
             break
-        res = _extract_json("".join(chat(_cluster_prompt(members)))) or {}
+        res = _extract_json(
+            "".join(chat(_cluster_prompt(members))),
+            required_fields=("label",),
+            optional_fields=("summary", "types"),
+        ) or {}
         module = {
             "id": ci,
             "label": res.get("label") or f"module_{ci}",
@@ -945,6 +1019,7 @@ def lift_binary_clustered(
                             r2, code = agent_res, agent_res["code"]
                             new_name = a_new
                             signature = agent_res.get("signature") or signature
+                            n_bad = defects(code, new_name)
             if "code" not in r2:
                 agent_res = _agent_lift(
                     rec, symbols, [], store, sha256, chat
@@ -970,8 +1045,8 @@ def lift_binary_clustered(
                 while f"{new_name}_{n}" in used_names:
                     n += 1
                 renamed = f"{new_name}_{n}"
-                signature = signature.replace(new_name, renamed, 1)
-                code = re.sub(rf"\b{re.escape(new_name)}\b", renamed, code)
+                signature = _rename_signature(signature, new_name, renamed)
+                code = _replace_name(code, new_name, renamed)
                 new_name = renamed
             used_names.add(new_name)
             symbols[rec["name"]] = {
@@ -1001,10 +1076,10 @@ def lift_binary_clustered(
     }
     for orig, s in symbols.items():
         code = s["code"]
-        for o, new in renames.items():
-            if o != orig and o in code:
-                code = re.sub(rf"\b{re.escape(o)}\b", new, code)
-        s["code"] = code
+        s["code"] = _rewrite_names(
+            code, {o: new for o, new in renames.items() if o != orig},
+            {r["name"] for r in uniq} | base_known,
+        )
 
     known = {s["name"] for s in symbols.values()} | base_known
     for orig, s in symbols.items():

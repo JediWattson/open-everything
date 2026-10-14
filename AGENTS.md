@@ -14,7 +14,9 @@ and stored in LanceDB for semantic search ("RAG over a binary").
   function incl. vector) and `binaries` (registry keyed by sha256).
 - `src/openeverything/graph.py` — SQLite `edges` table (name-keyed
   caller→callee per binary) for multi-hop call-graph traversal via
-  recursive CTEs. Derived index — rebuilt from `callees` on ingest.
+  recursive CTEs. Names preserve namespaces; collisions such as C++
+  overloads get an entry-address suffix. Derived index — rebuilt from
+  `callees` on ingest.
 - `src/openeverything/llm.py` — LLM backends for `oe ask`/`agent`/`chat`/
   `lift`: in-process mlx-lm on Metal (default), a running Ollama server,
   or any OpenAI-compatible endpoint (`OE_LLM_BACKEND=api` +
@@ -77,8 +79,9 @@ Notes:
 - Embedding model: `Qodo/Qodo-Embed-1-1.5B` by default (code-specialized,
   bidirectional attention, 1536-dim). Two backends (`OE_EMBED_BACKEND`):
   `mlx` (default) loads the bare Qwen2 backbone + safetensors via mlx_lm
-  with a padding-mask patch for bidirectional attention (`embed.py:
-  MlxEmbedder`); `st`/`torch` is the SentenceTransformer path, which falls
+  with an embedding-specific forward and padding-only attention mask
+  (`embed.py: MlxEmbedder`), leaving decoder attention unchanged;
+  `st`/`torch` is the SentenceTransformer path, which falls
   back to the native qwen2 arch and patches `create_causal_mask` ->
   `create_bidirectional_mask` (`embed.py:_force_bidirectional`) since the
   bundled remote code predates transformers 5.x. Vectors are
@@ -88,6 +91,14 @@ Notes:
   `oe match` treats a NULL vector as "no semantic evidence" and can rank
   on fingerprint alone (fpd column). Rows remember their intended `model`
   so `oe embed` batches by model.
+- Forced ingestion finishes extraction and embedding before replacing
+  existing rows. Failed writes restore that binary's LanceDB rows and
+  roll back its graph changes. Context lists have explicit string types;
+  legacy empty-list schemas are upgraded on the next ingest.
+- Re-ingest affected binaries with `--force` to repair previously collapsed
+  C++ names or disassembly call graphs; existing rows are not re-extracted
+  automatically. The disassembly frontend consistently selects arm64,
+  including in universal binaries.
 - Device: MPS (Metal) is auto-detected; `OE_DEVICE=cpu` forces CPU. On MPS the
   model loads bf16 — fp32 OOMs a 16 GB unified-memory Mac. Embed batch is 16
   for the same reason.

@@ -131,14 +131,36 @@ class Embedder:
         return self.embed_docs(texts)
 
 
+def _make_bidirectional_qwen2(args):
+    """Build a local embedding backbone without changing Qwen2's decoder code."""
+    import mlx.core as mx
+    from mlx_lm.models import qwen2
+
+    class BidirectionalQwen2Model(qwen2.Qwen2Model):
+        def __call__(self, inputs, lengths):
+            h = self.embed_tokens(inputs)
+            keep = mx.arange(h.shape[1])[None, :] < lengths[:, None]
+            mask = mx.where(keep, 0.0, -mx.inf)[:, None, None, :].astype(
+                h.dtype
+            )
+            # Embeddings use the local backbone without generation caches or
+            # pipeline sharding. Pass our mask directly to these layers so
+            # concurrent language models retain their causal attention.
+            for layer in self.layers:
+                h = layer(h, mask, None)
+            return self.norm(h)
+
+    return BidirectionalQwen2Model(args)
+
+
 class MlxEmbedder:
     """mlx-lm-backed embedder — same interface as Embedder, Apple-silicon
     native memory behaviour (lazy weights, cache limits) instead of MPS.
 
     Qodo-Embed is Qwen2-arch with is_causal=false: bidirectional attention.
     mlx's scaled_dot_product_attention with mask=None is already full
-    attention, so the only patch needed is suppressing the causal mask
-    Qwen2Model builds internally — plus a padding mask when batching.
+    attention. Its embedding-specific backbone passes a padding-only mask
+    directly to the layers, leaving Qwen2's language-model forward unchanged.
     Pooling is last-non-pad-token (1_Pooling: pooling_mode_lasttoken).
     """
 
@@ -156,7 +178,7 @@ class MlxEmbedder:
             "*.safetensors", "*.json", "*.txt"])
         with open(f"{path}/config.json") as f:
             args = qwen2.ModelArgs.from_dict(json.load(f))
-        self._model = qwen2.Qwen2Model(args)  # backbone only, no lm_head
+        self._model = _make_bidirectional_qwen2(args)  # no lm_head
         weights = {}
         for shard in sorted(glob.glob(f"{path}/*.safetensors")):
             weights.update(mx.load(shard))
@@ -169,8 +191,6 @@ class MlxEmbedder:
         # max window for tokenization — docs are already capped by
         # _MAX_BODY_CHARS, so this only bounds pathological inputs
         self._max_len = int(os.environ.get("OE_MLX_MAX_LEN", "2048"))
-        self._pad_lens: mx.array | None = None
-        self._patch_bidirectional()
         self.dim = int(args.hidden_size)
 
     def _bf16(self) -> None:
@@ -181,30 +201,6 @@ class MlxEmbedder:
             lambda p: p.astype(mx.bfloat16), self._model.parameters()
         )
         self._model.update(params)
-
-    def _patch_bidirectional(self) -> None:
-        """Qwen2Model.__call__ hardcodes create_attention_mask(h, cache) —
-        swap it for a padding-only mask (or None when unpadded)."""
-        import mlx.core as mx
-
-        mod = __import__(self._model.__module__, fromlist=["x"])
-        orig = getattr(mod, "create_attention_mask", None)
-        if orig is None or getattr(orig, "_oe_patched", False):
-            return
-        embedder = self
-
-        def mask_fn(h, cache=None, *args, **kwargs):
-            lens = embedder._pad_lens
-            if lens is None:
-                return None  # full bidirectional, no padding
-            L = h.shape[1]
-            keep = mx.arange(L)[None, :] < lens[:, None]
-            return mx.where(keep, 0.0, -mx.inf)[:, None, None, :].astype(
-                h.dtype
-            )
-
-        mask_fn._oe_patched = True
-        mod.create_attention_mask = mask_fn
 
     def _encode(self, texts: list[str]) -> list[list[float]]:
         mx = self._mx
@@ -217,11 +213,7 @@ class MlxEmbedder:
         batch = mx.array(
             [i + [pad] * (L - len(i)) for i in ids], dtype=mx.int32
         )
-        self._pad_lens = lens
-        try:
-            h = self._model(batch)  # [B, L, D] post-norm hidden states
-        finally:
-            self._pad_lens = None
+        h = self._model(batch, lengths=lens)  # [B, L, D] post-norm states
         pooled = h[mx.arange(len(ids)), lens - 1]
         pooled = pooled / mx.linalg.norm(pooled, axis=-1, keepdims=True)
         mx.eval(pooled)

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+from contextlib import nullcontext
 from pathlib import Path
 
 from .embed import Embedder, MlxEmbedder, build_embed_text
@@ -41,11 +42,6 @@ def ingest(
     if store.indexed_sha(sha) and not force:
         return sha, 0
 
-    if force:
-        store.drop_binary(sha)
-        if graph is not None:
-            graph.drop_binary(sha)
-
     if frontend == "disasm":
         from .disasm import extract_disasm as extract
     else:
@@ -53,6 +49,8 @@ def ingest(
     recs: list[FunctionRecord] = list(
         extract(binary, sha, name, on_progress=on_progress)
     )
+    if not recs:
+        raise ValueError(f"no functions extracted from {binary}")
     for r in recs:
         # embedder=None -> deferred embedding (`oe ingest --defer-embed`):
         # rows land with vector=NULL and `model` naming the model `oe embed`
@@ -66,11 +64,21 @@ def ingest(
         batch = int(os.environ.get("OE_EMBED_BATCH", "16"))
         for i in range(0, len(recs), batch):
             vecs = embedder.embed_docs([r.embed_text for r in recs[i : i + batch]])
+            if len(vecs) != len(recs[i : i + batch]):
+                raise ValueError("embedder returned the wrong number of vectors")
             for r, v in zip(recs[i : i + batch], vecs):
                 r.vector = v
 
-    store.add_functions(recs)
-    if graph is not None:
-        graph.add_edges(sha, ((r.name, c) for r in recs for c in r.callees))
-    store.register_binary(sha, name, str(binary), len(recs))
+    # Keep the old index until extraction and embedding have succeeded. If a
+    # write fails, restore this binary's LanceDB rows and roll back graph writes.
+    graph_update = graph.transaction() if graph is not None else nullcontext()
+    with store.preserve_binary(sha), graph_update:
+        if force:
+            store.drop_binary(sha)
+            if graph is not None:
+                graph.drop_binary(sha)
+        store.add_functions(recs)
+        if graph is not None:
+            graph.add_edges(sha, ((r.name, c) for r in recs for c in r.callees))
+        store.register_binary(sha, name, str(binary), len(recs))
     return sha, len(recs)

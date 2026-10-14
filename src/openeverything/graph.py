@@ -3,13 +3,14 @@
 LanceDB stays the store of record for function rows + vectors; this edge
 table exists so multi-hop traversal ("what reaches X", "what does Y call")
 runs as one recursive CTE instead of N filtered LanceDB queries. Edges are
-keyed by function name — that's the identifier users query by, and Ghidra
-names are effectively unique per program.
+keyed by the extractor's unique function names, including namespaces and
+address suffixes when required to distinguish overloads.
 """
 
 from __future__ import annotations
 
 import sqlite3
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Iterable
 
@@ -32,14 +33,29 @@ class GraphStore:
         path.parent.mkdir(parents=True, exist_ok=True)
         self._conn = sqlite3.connect(str(path))
         self._conn.executescript(_SCHEMA)
+        self._savepoint = 0
 
     def close(self) -> None:
         self._conn.close()
 
+    @contextmanager
+    def transaction(self):
+        """Group graph writes, including nested add/drop calls, for rollback."""
+        self._savepoint += 1
+        name = f"oe_write_{self._savepoint}"
+        self._conn.execute(f"SAVEPOINT {name}")
+        try:
+            yield
+            self._conn.execute(f"RELEASE SAVEPOINT {name}")
+        except BaseException:
+            self._conn.execute(f"ROLLBACK TO SAVEPOINT {name}")
+            self._conn.execute(f"RELEASE SAVEPOINT {name}")
+            raise
+
     def add_edges(
         self, binary_sha256: str, edges: Iterable[tuple[str, str]]
     ) -> None:
-        with self._conn:
+        with self.transaction():
             self._conn.executemany(
                 "INSERT OR IGNORE INTO edges (binary_sha256, caller, callee) "
                 "VALUES (?, ?, ?)",
@@ -47,7 +63,7 @@ class GraphStore:
             )
 
     def drop_binary(self, binary_sha256: str) -> int:
-        with self._conn:
+        with self.transaction():
             cur = self._conn.execute(
                 "DELETE FROM edges WHERE binary_sha256 = ?", (binary_sha256,)
             )

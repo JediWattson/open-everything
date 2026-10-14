@@ -8,6 +8,7 @@ as Ghidra programs inside a shared project dir under ~/.open-everything.
 from __future__ import annotations
 
 import os
+from collections import defaultdict
 from pathlib import Path
 from typing import Callable, Iterator
 
@@ -74,6 +75,38 @@ def _func_strings(program, func) -> list[str]:
     return out
 
 
+def _function_key(func) -> str:
+    """Keep memory and external address spaces distinct in the name index."""
+    return str(func.getEntryPoint())
+
+
+def _function_names(functions) -> dict[str, str]:
+    """Qualified names, with address suffixes for overloads/collisions.
+
+    Ordinary C names remain unchanged. References may include external
+    functions absent from getFunctions(), so callers supply those too.
+    """
+    by_address = {_function_key(func): func for func in functions}
+    by_name: dict[str, list[str]] = defaultdict(list)
+    for key, func in by_address.items():
+        by_name[str(func.getName(True))].append(key)
+    names = {}
+    taken = set(by_name)
+    for name, keys in by_name.items():
+        for key in sorted(keys):
+            if len(keys) == 1:
+                names[key] = name
+                continue
+            base = f"{name}__0x{by_address[key].getEntryPoint().getOffset():x}"
+            unique, suffix = base, 2
+            while unique in taken:
+                unique = f"{base}_{suffix}"
+                suffix += 1
+            names[key] = unique
+            taken.add(unique)
+    return names
+
+
 def extract_functions(
     binary: Path,
     binary_sha256: str,
@@ -105,8 +138,28 @@ def extract_functions(
         funcs = list(fm.getFunctions(True))
         total = len(funcs)
         try:
+            # Use one identity map for records and all their references. In
+            # particular, getFunctions() need not include external callees.
+            referenced = list(funcs)
+            links = {}
+            thunk_targets = {}
+            for func in funcs:
+                key = _function_key(func)
+                called = list(func.getCalledFunctions(monitor))
+                calling = list(func.getCallingFunctions(monitor))
+                links[key] = (called, calling)
+                referenced.extend(called)
+                referenced.extend(calling)
+                if func.isThunk():
+                    target = func.getThunkedFunction(True)
+                    thunk_targets[key] = target
+                    if target is not None:
+                        referenced.append(target)
+            names = _function_names(referenced)
+
             for i, func in enumerate(funcs):
-                name = func.getName()
+                key = _function_key(func)
+                name = names[key]
                 if on_progress:
                     on_progress(i + 1, total, name)
 
@@ -125,19 +178,17 @@ def extract_functions(
                     except Exception:
                         pass
 
-                callees = sorted(
-                    {c.getName() for c in func.getCalledFunctions(monitor)}
-                )
-                callers = sorted(
-                    {c.getName() for c in func.getCallingFunctions(monitor)}
-                )
+                called, calling = links[key]
+                callees = sorted({names[_function_key(c)] for c in called})
+                callers = sorted({names[_function_key(c)] for c in calling})
 
                 strings = [] if is_external else _func_strings(program, func)
 
                 if is_thunk:
-                    thunked = func.getThunkedFunction(True)
+                    thunked = thunk_targets[key]
                     decompiled = (
-                        f"thunk -> {thunked.getName()}" if thunked else "thunk"
+                        f"thunk -> {names[_function_key(thunked)]}"
+                        if thunked is not None else "thunk"
                     )
 
                 yield FunctionRecord(

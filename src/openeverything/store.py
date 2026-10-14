@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import time
+from contextlib import contextmanager
 from pathlib import Path
 
 import lancedb
@@ -13,8 +14,9 @@ from .models import FunctionRecord
 
 class Store:
     def __init__(self, db_dir: Path | None = None):
-        config.DB_DIR.mkdir(parents=True, exist_ok=True)
-        self._db = lancedb.connect(str(db_dir or config.DB_DIR))
+        path = db_dir or config.DB_DIR
+        path.mkdir(parents=True, exist_ok=True)
+        self._db = lancedb.connect(str(path))
 
     def _table(self):
         return self._db.open_table(config.TABLE_NAME)
@@ -35,31 +37,88 @@ class Store:
         return bool(rows)
 
     def add_functions(self, recs: list[FunctionRecord]) -> None:
+        if not recs:
+            return
+        import pyarrow as pa
+
         rows = [r.to_row() for r in recs]
         if config.TABLE_NAME in self._db.list_tables().tables:
-            self._table().add(rows)
-        elif all(r["vector"] is None for r in rows):
-            # All-deferred batch on a fresh DB: declare the vector column
-            # explicitly or it'd be created as a Null-type, unbackfillable.
-            import pyarrow as pa
+            table = self._table()
+            # Older indexes inferred List(Null) from initially empty lists.
+            schema = table.schema
+            for name in ("callees", "callers", "strings"):
+                field = schema.field(name)
+                if pa.types.is_null(field.type.value_type):
+                    schema = schema.set(
+                        schema.get_field_index(name), field.with_type(pa.list_(pa.string()))
+                    )
+            if schema != table.schema:
+                # Lance cannot alter List(Null) directly. Arrow can cast it;
+                # replace the table in one versioned write to preserve rows.
+                table.add(table.to_arrow().cast(schema), mode="overwrite")
+            table.add(rows)
+            return
 
-            dim = config.MODEL_DIMS.get(recs[0].model)
-            if dim is None:
-                raise ValueError(
-                    f"unknown dim for model {recs[0].model!r} — add it to "
-                    "config.MODEL_DIMS or run `oe embed` first"
-                )
-            fields = [
-                pa.field(k, pa.infer_type(pa.array([r[k] for r in rows])))
-                for k in rows[0]
-                if k != "vector"
-            ]
-            fields.append(pa.field("vector", pa.list_(pa.float32(), dim)))
-            self._db.create_table(
-                config.TABLE_NAME, rows, schema=pa.schema(fields)
+        vector = next((r.vector for r in recs if r.vector is not None), None)
+        dim = len(vector) if vector is not None else config.MODEL_DIMS.get(recs[0].model)
+        if dim is None:
+            raise ValueError(
+                f"unknown dim for model {recs[0].model!r} — add it to "
+                "config.MODEL_DIMS or ingest with embedding enabled"
             )
-        else:
-            self._db.create_table(config.TABLE_NAME, rows)
+        fields = []
+        for name in rows[0]:
+            if name == "vector":
+                dtype = pa.list_(pa.float32(), dim)
+            elif name in ("callees", "callers", "strings"):
+                dtype = pa.list_(pa.string())
+            elif name in ("is_external", "is_thunk"):
+                dtype = pa.bool_()
+            elif name == "size":
+                dtype = pa.int64()
+            else:
+                dtype = pa.string()
+            fields.append(pa.field(name, dtype))
+        self._db.create_table(config.TABLE_NAME, rows, schema=pa.schema(fields))
+
+    @contextmanager
+    def preserve_binary(self, sha256: str):
+        """Restore this binary's rows if an ingest write raises.
+
+        Snapshots cover both LanceDB tables and leave other binaries alone.
+        Extraction and embedding should finish before entering this scope.
+        """
+        condition = f"binary_sha256 = '{sha256}'"
+        tables = self._db.list_tables().tables
+        snapshots = {
+            name: self._db.open_table(name).search().where(condition).to_arrow()
+            if name in tables else None
+            for name in (config.TABLE_NAME, "binaries")
+        }
+        try:
+            yield
+        except BaseException as original:
+            failures = []
+            for name, snapshot in snapshots.items():
+                try:
+                    if name not in self._db.list_tables().tables:
+                        if snapshot is not None:
+                            self._db.create_table(name, snapshot)
+                        continue
+                    table = self._db.open_table(name)
+                    table.delete(condition)
+                    if snapshot is not None and snapshot.num_rows:
+                        table.add(snapshot.cast(table.schema))
+                    elif snapshot is None and table.count_rows() == 0:
+                        self._db.drop_table(name)
+                except BaseException as error:
+                    failures.append(error)
+            if failures:
+                raise BaseExceptionGroup(
+                    "ingest failed and the previous index could not be fully restored",
+                    [original, *failures],
+                ) from None
+            raise
 
     def missing_vectors(
         self, binary_sha256: str | None = None, model: str | None = None

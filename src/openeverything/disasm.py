@@ -173,6 +173,7 @@ class MachO:
 
 
 _BL_RE = re.compile(r"\bb(l|)\s+(0x?[0-9a-f]+)", re.I)
+_NAMED_BRANCH_RE = re.compile(r"^b(?:l)?\s+([^\s;]+)")
 _ADDR_RE = re.compile(r"^([0-9a-f]{8,16})\s")
 # otool annotates resolved references: `adrp x8, 12 ; 0x10000c000`,
 # `add x8, x8, #0x2c ; literal pool for: "…"`,
@@ -208,19 +209,45 @@ def _fn_strings(mo: MachO, body_ins: list[str]) -> list[str]:
     return list(dict.fromkeys(out))[:20]
 
 
-def disasm_text(binary: Path) -> dict[int, str]:
-    """addr -> instruction (mnemonic + operands) via `otool -tv`."""
+def disasm_text(
+    binary: Path, symbols: dict[int, str] | None = None
+) -> dict[int, str]:
+    """arm64 addr -> instruction, resolving otool's named branch targets."""
     out = subprocess.run(
-        ["otool", "-tv", str(binary)], capture_output=True, text=True
+        ["otool", "-arch", "arm64", "-tv", str(binary)],
+        capture_output=True, text=True, check=True,
     ).stdout
     insns: dict[int, str] = {}
+    labels = {name: addr for addr, name in (symbols or {}).items()}
+    pending_label = None
     for line in out.splitlines():
         m = _ADDR_RE.match(line)
         if not m:
+            if line.endswith(":"):
+                pending_label = line[:-1].strip()
             continue
+        addr = int(m.group(1), 16)
+        if pending_label is not None:
+            labels[pending_label] = addr
+            pending_label = None
         ins = line[m.end() :].strip()
         ins = re.sub(r"^[0-9a-f]{8}\s+", "", ins)  # raw-bytes column
-        insns[int(m.group(1), 16)] = ins
+        insns[addr] = ins
+
+    # otool prints local named functions as `bl _foo`, even when other calls
+    # in the same binary use numeric operands. Normalize both to addresses.
+    for addr, ins in insns.items():
+        m = _NAMED_BRANCH_RE.match(ins)
+        if not m:
+            continue
+        target = m.group(1)
+        resolved = labels.get(target)
+        if resolved is None and "+0x" in target:
+            name, offset = target.rsplit("+", 1)
+            if name in labels and re.fullmatch(r"0x[0-9a-f]+", offset, re.I):
+                resolved = labels[name] + int(offset, 16)
+        if resolved is not None:
+            insns[addr] = ins[:m.start(1)] + f"0x{resolved:x}" + ins[m.end(1):]
     return insns
 
 
@@ -232,7 +259,7 @@ def extract_disasm(
 ) -> Iterator[FunctionRecord]:
     """Ghidra-free function records: boundaries + asm, no decompile."""
     mo = MachO(binary)
-    insns = disasm_text(binary)
+    insns = disasm_text(binary, mo.symbols)
     insn_addrs = sorted(insns)
     stub_by_addr = dict(mo.stub_functions())
     # `; symbol stub for: _name` comments name stub call targets directly
@@ -303,7 +330,9 @@ def extract_disasm(
             m = _BL_RE.search(ins)
             if m:
                 tgt_fn = _fn_of(int(m.group(2), 0))
-                if tgt_fn is not None:
+                # A local unconditional jump is control flow, not recursion.
+                # Keep bl-to-self: that is an actual recursive call.
+                if tgt_fn is not None and (m.group(1) or tgt_fn != start):
                     callees.append(_name_of(tgt_fn))
         asm = "\n".join(f"0x{a:x}: {insns[a]}" for a in insn_addrs[lo:hi])
         if on_progress:
