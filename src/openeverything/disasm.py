@@ -293,6 +293,11 @@ def extract_disasm(
         is_stub = start in stub_by_addr
         if not body_ins and not is_stub:
             continue
+        # LC_FUNCTION_STARTS also lists embedded jump tables (data words
+        # that disassemble as `udf`). A real function never starts with
+        # one — skip udf-headed regions so they can't embed/match as code.
+        if body_ins and body_ins[0].startswith("udf"):
+            continue
         callees = []
         for ins in body_ins:
             m = _BL_RE.search(ins)
