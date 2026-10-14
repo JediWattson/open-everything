@@ -104,9 +104,20 @@ def function_cfg(asm: str) -> dict:
     }
 
 
+def _strshape(s: str) -> str:
+    """String-literal *shape*: leading keyword + format-specifier multiset.
+    'usage: rmdir [-pv] dir\\n' and 'usage: hostname [-f]\\n' share the shape
+    'usage:|' — role-identical strings cluster even when content differs."""
+    s = s.strip().lower()
+    head = s.split(None, 1)[0][:16] if s else ""
+    fmts = "".join(re.findall(r"%\w", s))
+    return f"{head}|{fmts}"
+
+
 def fingerprint(rec: dict) -> tuple | None:
-    """(numeric vec, callee-set) structural fingerprint for identity
-    matching — nearly opt-level-invariant. None for bodiless rows."""
+    """(numeric vec, callee-set, string-shape-set) structural fingerprint
+    for identity matching — nearly opt-level-invariant. None for bodiless
+    rows."""
     import math
 
     if not rec.get("decompiled") or rec.get("is_external") \
@@ -120,15 +131,21 @@ def fingerprint(rec: dict) -> tuple | None:
         c["indirect"], math.log1p(rec.get("size") or 1),
         len(rec.get("callees") or ()),
     )
-    return vec, frozenset(rec.get("callees") or ())
+    shapes = frozenset(
+        _strshape(s) for s in (rec.get("strings") or ()) if s.strip()
+    )
+    return vec, frozenset(rec.get("callees") or ()), shapes
 
 
 def fdist(a: tuple, b: tuple) -> float:
     """Fingerprint distance: relative diff on numeric features +
     callee-set Jaccard (weight 2 — call targets are the most
-    opt-invariant signal)."""
-    (va, ca), (vb, cb) = a, b
+    opt-invariant signal) + string-shape Jaccard (weight 1 — literal
+    roles like 'usage:' / '%s: %s' survive renaming/rewording)."""
+    (va, ca, sa), (vb, cb, sb) = a, b
     num = sum(abs(x - y) / (x + y + 1.0) for x, y in zip(va, vb))
     if ca or cb:
         num += 2.0 * (1 - len(ca & cb) / len(ca | cb))
+    if sa or sb:
+        num += 1.0 * (1 - len(sa & sb) / len(sa | sb))
     return num

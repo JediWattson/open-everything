@@ -44,12 +44,15 @@ def main() -> None:
         if r["binary_sha256"] in by_sha:
             by_sha[r["binary_sha256"]].append(r)
 
-    # keep real functions with a vector and a body; fingerprints once
+    # keep real functions with a vector and a body; fingerprints once.
+    # <8 insns: stub/trampoline territory — structurally indistinguishable,
+    # pure match noise
     for sha, rows in by_sha.items():
         rows[:] = [
             r for r in rows
             if r["vector"] is not None and r["decompiled"]
             and not r["is_external"] and not r["is_thunk"]
+            and len(r["decompiled"].splitlines()) >= 8
         ]
         for r in rows:
             r["fp"] = fingerprint(r)
