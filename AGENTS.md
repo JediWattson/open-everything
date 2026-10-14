@@ -40,6 +40,12 @@ and stored in LanceDB for semantic search ("RAG over a binary").
   so callers see lifted callee signatures. Emits `lifted/<bin>/{decls.h,
   lifted.cpp, lift_report.json}`. Exact-body dedupe merges identical bodies;
   output is best-effort readable C++, not guaranteed-compilable.
+  Confabulation guard: emitted calls not in the real callee set, and real
+  callees deleted from the body, both count as defects — one corrective
+  retry, then a constrained mini-agent tier (functions()/show() to look up
+  real names, mandatory pydantic-validated emit() as the final action).
+  Retries/agent output are adopted only on strict defect reduction;
+  leftovers stay in `lift_report.json` unresolved/dropped fields.
 - `src/openeverything/pipeline.py` — ingest orchestration.
 - `src/openeverything/cli.py` — `oe` CLI (typer + rich).
 
