@@ -10,6 +10,13 @@ and stored in LanceDB for semantic search ("RAG over a binary").
   function, collects callees/callers, referenced strings, thunks/externals.
 - `src/openeverything/embed.py` — `build_embed_text` (signature + calls +
   called-by + strings + body) and the SentenceTransformer `Embedder`.
+  Local function names are masked to `FUNC`/`DATA` (self-name in the
+  signature, calls/called-by entries, FUN_*/DAT_* body tokens) so an
+  anonymous twin embeds like its named twin — identity names carry no
+  signal. External stubs keep names (cross-binary semantic anchors);
+  ingest computes `external_names` from is_external/is_thunk rows.
+  `oe embed` reuses the stored `embed_text`, so this only changes on
+  re-ingest (`--force`).
 - `src/openeverything/store.py` — LanceDB tables `functions` (one row per
   function incl. vector) and `binaries` (registry keyed by sha256).
 - `src/openeverything/graph.py` — SQLite `edges` table (name-keyed
@@ -140,9 +147,11 @@ oe clusters <bin> --graph           # call-graph communities instead — exact,
 oe splice <target> --from <donor> --seed <fn>...   # graft donor subsystem into target
 oe names <binary> [-o names.json]   # propose FUN_* names from clone-catalog
                                     #   twins (same/similar verdicts, plus
-                                    #   watch pairs at fpd<=0.1 — identical
-                                    #   structure whose FUN_* token alone
-                                    #   drags cosine below `similar`)
+                                    #   watch pairs at fpd<=0.1). Donor
+                                    #   corpora: tests/corpus/build_pairs.sh
+                                    #   builds named+stripped twins of the
+                                    #   corpus sources — ingest both halves
+                                    #   and oe names recovers real symbols.
 oe lift <binary> --names names.json # propagate donor name+signature into the
                                     #   lift; evidence-backed clone names win
                                     #   over model-guessed names (guess kept
