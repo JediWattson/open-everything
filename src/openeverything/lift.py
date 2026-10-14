@@ -68,6 +68,16 @@ def _body_hash(body: str) -> str:
     return hashlib.sha1(" ".join(body.split()).encode()).hexdigest()
 
 
+def _unresolved(code: str, known: set[str], self_name: str) -> list[str]:
+    """Callees in emitted code with no matching symbol — LLM confabulation
+    detector: real callees come from the record, so invented names show up
+    here immediately. String literals are stripped first — 'malloc()' inside
+    \"malloc() failure\" is text, not a call."""
+    bare = re.sub(r'"(?:[^"\\]|\\.)*"', '""', code)
+    called = set(re.findall(r"\b([a-zA-Z_]\w*)\s*\(", bare))
+    return sorted(called - known - {self_name})
+
+
 def _extract_json(text: str) -> dict | None:
     dec = json.JSONDecoder()
     for i, ch in enumerate(text):
@@ -134,6 +144,12 @@ def lift_binary(
     if limit:
         order = order[:limit]
 
+    # known-callable universe: real callees from the records (incl. external
+    # stubs like _err) + intrinsics; lifted names accrete as we go.
+    base_known = {c for r in uniq for c in r["callees"]}
+    base_known |= {n.lstrip("_") for n in base_known}
+    base_known |= set(_INTRINSICS)
+
     symbols: dict[str, dict] = {}
     used_names: set[str] = set()
     for i, rec in enumerate(order):
@@ -144,6 +160,30 @@ def lift_binary(
         new_name = res.get("name") or rec["name"]
         signature = res.get("signature") or rec["signature"]
         code = res.get("code") or rec["decompiled"]
+        # Confabulation check + one corrective retry: code calling a name
+        # that isn't a real callee gets bounced back with the offenders.
+        known = base_known | {s["name"] for s in symbols.values()}
+        bad = _unresolved(code, known, new_name)
+        if "code" in res and bad:
+            msgs = _lift_prompt(rec, symbols) + [{
+                "role": "user",
+                "content": (
+                    "Your code called functions that do not exist in this "
+                    f"binary: {', '.join(bad)}. Only call names from the "
+                    "callee list or the given signatures — anything else "
+                    "must keep its original FUN_* token. Emit the corrected "
+                    "JSON object."
+                ),
+            }]
+            r2 = _extract_json("".join(chat(msgs)))
+            if r2 and "code" in r2:
+                # adopt the retry only if it strictly reduces unresolved
+                # calls — a worse rewrite (e.g. asm-as-calls) gets dropped
+                n2 = r2.get("name") or new_name
+                bad2 = _unresolved(r2["code"], known, n2)
+                if len(bad2) < len(bad):
+                    res, code = r2, r2["code"]
+                    new_name, signature = n2, r2.get("signature") or signature
         if new_name in used_names:
             n = 2
             while f"{new_name}_{n}" in used_names:
@@ -162,6 +202,17 @@ def lift_binary(
             "failed": "code" not in res,
         }
 
+    # LLMs lowercase FUN_ tokens; restore them so the rename pass sees them.
+    fun_pat = re.compile(r"\bfun_([0-9a-f]{8,})\b")
+    orig_names = set(symbols)
+    for fn in order:
+        code = symbols[fn["name"]]["code"]
+        symbols[fn["name"]]["code"] = fun_pat.sub(
+            lambda m: f"FUN_{m.group(1)}"
+            if f"FUN_{m.group(1)}" in orig_names else m.group(0),
+            code,
+        )
+
     # Post-pass: rewrite every lifted original name anywhere it appears in
     # emitted code — covers LLM non-compliance and non-callee references
     # (function pointers, thunks) the per-function prompt can't see.
@@ -177,15 +228,10 @@ def lift_binary(
 
     # Unresolved call sites: names called in code that have no lifted symbol
     # or decl — mostly LLM-invented names; recorded as a quality metric.
-    known = {s["name"] for s in symbols.values()}
-    known |= {c for r in uniq for c in r["callees"]}
-    # Ghidra Mach-O names keep the '_' prefix — LLM output uses the C name
-    known |= {n.lstrip("_") for n in known}
-    known |= set(_INTRINSICS)
+    known = {s["name"] for s in symbols.values()} | base_known
     for fn in order:
         s = symbols[fn["name"]]
-        called = set(re.findall(r"\b([a-zA-Z_]\w*)\s*\(", s["code"]))
-        s["unresolved"] = sorted(called - known - {s["name"]})
+        s["unresolved"] = _unresolved(s["code"], known, s["name"])
 
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -366,6 +412,10 @@ def lift_binary_clustered(
 
     groups = _cluster_order(cluster_functions(uniq, threshold))
 
+    base_known = {c for r in uniq for c in r["callees"]}
+    base_known |= {n.lstrip("_") for n in base_known}
+    base_known |= set(_INTRINSICS)
+
     symbols: dict[str, dict] = {}
     used_names: set[str] = set()
     modules: list[dict] = []
@@ -394,6 +444,27 @@ def lift_binary_clustered(
             new_name = r2.get("name") or rec["name"]
             signature = r2.get("signature") or rec["signature"]
             code = r2.get("code") or rec["decompiled"]
+            known = base_known | {s["name"] for s in symbols.values()}
+            bad = _unresolved(code, known, new_name)
+            if "code" in r2 and bad:
+                msgs = _lift_prompt_ctx(rec, symbols, module) + [{
+                    "role": "user",
+                    "content": (
+                        "Your code called functions that do not exist in "
+                        f"this binary: {', '.join(bad)}. Only call names "
+                        "from the callee list or the given signatures — "
+                        "anything else must keep its original FUN_* token. "
+                        "Emit the corrected JSON object."
+                    ),
+                }]
+                r3 = _extract_json("".join(chat(msgs)))
+                if r3 and "code" in r3:
+                    n3 = r3.get("name") or new_name
+                    bad3 = _unresolved(r3["code"], known, n3)
+                    if len(bad3) < len(bad):
+                        r2, code = r3, r3["code"]
+                        new_name = n3
+                        signature = r3.get("signature") or signature
             if new_name in used_names:
                 n = 2
                 while f"{new_name}_{n}" in used_names:
@@ -414,6 +485,16 @@ def lift_binary_clustered(
                 "failed": "code" not in r2,
             }
 
+    # LLMs lowercase FUN_ tokens; restore them so the rename pass sees them.
+    fun_pat = re.compile(r"\bfun_([0-9a-f]{8,})\b")
+    orig_names = set(symbols)
+    for s in symbols.values():
+        s["code"] = fun_pat.sub(
+            lambda m: f"FUN_{m.group(1)}"
+            if f"FUN_{m.group(1)}" in orig_names else m.group(0),
+            s["code"],
+        )
+
     # post-pass rename (same as flat lift)
     renames = {
         orig: s["name"] for orig, s in symbols.items() if s["name"] != orig
@@ -425,13 +506,9 @@ def lift_binary_clustered(
                 code = re.sub(rf"\b{re.escape(o)}\b", new, code)
         s["code"] = code
 
-    known = {s["name"] for s in symbols.values()}
-    known |= {c for r in uniq for c in r["callees"]}
-    known |= {n.lstrip("_") for n in known}
-    known |= set(_INTRINSICS)
+    known = {s["name"] for s in symbols.values()} | base_known
     for orig, s in symbols.items():
-        called = set(re.findall(r"\b([a-zA-Z_]\w*)\s*\(", s["code"]))
-        s["unresolved"] = sorted(called - known - {s["name"]})
+        s["unresolved"] = _unresolved(s["code"], known, s["name"])
 
     out_dir = Path(out_dir)
     mod_dir = out_dir / "modules"
