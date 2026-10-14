@@ -56,7 +56,9 @@ def ingest(
         # rows land with vector=NULL and `model` naming the model `oe embed`
         # will fill them with, so search/match can filter correctly meanwhile.
         r.model = model_name or (embedder.model_name if embedder else "")
-        r.embed_text = build_embed_text(r)
+    external_names = {r.name for r in recs if r.is_external or r.is_thunk}
+    for r in recs:
+        r.embed_text = build_embed_text(r, external_names)
 
     if embedder is not None:
         import os

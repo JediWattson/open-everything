@@ -9,6 +9,7 @@ retrieval matches on both what a function does and who it talks to.
 from __future__ import annotations
 
 import os
+import re
 
 import tabulate  # noqa: F401  pre-imported so torch's atexit handler doesn't hit jpype's dead import hook
 
@@ -18,21 +19,41 @@ from .models import FunctionRecord
 _MAX_BODY_CHARS = 8000
 _MAX_STRINGS = 20
 
+_LOCAL_TOK = re.compile(r"\b(FUN_[0-9a-fA-F]+|DAT_[0-9a-fA-F]+)\b")
 
-def build_embed_text(rec: FunctionRecord) -> str:
-    parts = [
-        f"function: {rec.name}",
-        f"signature: {rec.signature}",
-    ]
+
+def build_embed_text(
+    rec: FunctionRecord, external_names: set[str] | None = None
+) -> str:
+    """Structured doc for one function. Local function names are masked to
+    FUNC — an anonymous twin must embed like its named twin, so identity
+    tokens carry no signal (a FUN_* vs _foo pair is the same code).
+    External stubs (_printf) keep their names: they're semantic anchors
+    shared across binaries."""
+    if external_names is None:
+        external_names = set()
+
+    def mask(name: str) -> str:
+        return name if name in external_names else "FUNC"
+
+    sig = re.sub(
+        rf"(?<![\w:]){re.escape(rec.name)}(?=\s*\()", "FUNC", rec.signature
+    )
+    parts = ["function: FUNC", f"signature: {sig}"]
     if rec.callees:
-        parts.append("calls: " + ", ".join(rec.callees))
+        parts.append("calls: " + ", ".join(mask(c) for c in rec.callees))
     if rec.callers:
-        parts.append("called by: " + ", ".join(rec.callers))
+        parts.append("called by: " + ", ".join(mask(c) for c in rec.callers))
     if rec.strings:
         shown = rec.strings[:_MAX_STRINGS]
         parts.append("strings: " + " | ".join(s.replace("\n", " ") for s in shown))
     parts.append("---")
-    parts.append(rec.decompiled[:_MAX_BODY_CHARS] or "(no decompiled body)")
+    # Ghidra pseudocode bodies reference FUN_*/DAT_* tokens by name
+    body = _LOCAL_TOK.sub(
+        lambda m: "FUNC" if m.group(1).startswith("FUN_") else "DATA",
+        rec.decompiled[:_MAX_BODY_CHARS],
+    )
+    parts.append(body or "(no decompiled body)")
     return "\n".join(parts)
 
 

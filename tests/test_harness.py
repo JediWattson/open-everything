@@ -23,9 +23,10 @@ def _rec(name, callees=None, callers=None, strings=None, body="int x() {}",
 def test_embed_text_includes_call_context():
     r = _rec("check_pw", callees=["strcmp", "log_fail"], callers=["main"],
              strings=["bad password"])
-    text = build_embed_text(r)
-    assert "calls: strcmp, log_fail" in text
-    assert "called by: main" in text
+    # local names mask to FUNC; externals (strcmp) keep their names
+    text = build_embed_text(r, {"strcmp"})
+    assert "calls: strcmp, FUNC" in text
+    assert "called by: FUNC" in text
     assert "bad password" in text
     assert "int x() {}" in text
 
