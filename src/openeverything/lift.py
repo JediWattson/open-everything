@@ -398,8 +398,10 @@ def _lift_region_once(
             raw = re.sub(r"^```\w*\n?|\n?```\s*$", "", raw).strip()
         j = _extract_json(raw)
         if j and isinstance(j.get("code"), str):
-            return j["code"].strip()
-        return raw
+            raw = j["code"].strip()
+        # model sometimes calls a label: L_1000xxx() → goto L_1000xxx
+        return re.sub(r"\b(L_[0-9a-f]+)\s*\([^;{}]*\)\s*;",
+                      r"goto \1;", raw)
 
     msgs = [
         {"role": "system", "content":
@@ -436,6 +438,10 @@ def _lift_region_once(
         c2 = grab(raw2)
         if c2 and not violations(c2):
             code = c2
+        else:
+            # both attempts defective → fail the region honestly (its
+            # asm is inlined by the caller) rather than keep fake stubs
+            return None
     return code
 
 
