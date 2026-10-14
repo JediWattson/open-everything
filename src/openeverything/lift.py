@@ -208,12 +208,19 @@ def _agent_lift(
 
     msgs = _lift_prompt(rec, symbols)
     msgs[0] = {"role": "system", "content": _LIFT_AGENT_SYSTEM}
-    msgs[1]["content"] += (
-        "\n\nYour previous attempt mishandled these names — invented calls "
-        f"or dropped real callees: {', '.join(bad)}. Use functions()/show() "
-        "to check real names before emitting, and keep every callee the "
-        "assembly actually calls."
-    )
+    if bad:
+        msgs[1]["content"] += (
+            "\n\nYour previous attempt mishandled these names — invented "
+            f"calls or dropped real callees: {', '.join(bad)}. Use "
+            "functions()/show() to check real names before emitting, and "
+            "keep every callee the assembly actually calls."
+        )
+    else:
+        msgs[1]["content"] += (
+            "\n\nYour previous attempt produced no valid JSON. Use "
+            "functions()/show() to check real names, then finish with "
+            "emit()."
+        )
     for _ in range(max_turns):
         raw = "".join(chat(msgs, tools=_AGENT_SCHEMAS, temp=0.0))
         action = _extract_action(raw)
@@ -257,6 +264,225 @@ class _LiftEmit(BaseModel):
     code: str
 
 
+# --- tier-4 lift: regional decomposition for functions too big to emit ---
+#
+# A ~140-insn function fails the monolithic JSON emit. Instead: basic
+# blocks (cfg.blocks_of) are grouped into contiguous regions cut at loop
+# heads, regions are embedded+clustered so same-role blocks share an
+# LLM-assigned label, each region is lifted separately as labeled C
+# statements, and the function is stitched with goto edges.
+
+_REGION_MAX = 28   # insns per region
+_LIFT_BIG = 80     # asm-line floor for the regional path
+
+
+def _is_big(rec: dict) -> bool:
+    return sum(1 for l in rec["decompiled"].splitlines()
+               if re.match(r"\s*0x[0-9a-f]+:", l)) >= _LIFT_BIG
+
+
+def _regions(rec: dict, addr_names: dict | None = None) -> list[dict]:
+    """Contiguous basic-block runs (≤ _REGION_MAX insns), split at loop
+    heads so a loop body stays in one region."""
+    from .cfg import blocks_of
+
+    blocks = blocks_of(rec["decompiled"])
+    if len(blocks) < 4:
+        return []
+    back_heads = {d for b in blocks for d in b["succs"] if d <= b["addr"]}
+    regs, cur, n = [], [], 0
+    for b in blocks:
+        if cur and (n + len(b["insns"]) > _REGION_MAX
+                    or b["addr"] in back_heads):
+            regs.append(cur)
+            cur, n = [], 0
+        cur.append(b)
+        n += len(b["insns"])
+    if cur:
+        regs.append(cur)
+    label_of = {b["addr"]: f"L_{r[0]['addr']:x}"
+                for r in regs for b in r}
+    names = addr_names or {}
+
+    def render(b) -> str:
+        lines = []
+        for a, mn, ops in b["insns"]:
+            note = ""
+            if mn in ("bl", "b"):
+                t = re.search(r"0x[0-9a-f]+", ops)
+                if t and int(t.group(0), 16) in names:
+                    note = f"  // {names[int(t.group(0), 16)]}"
+            lines.append(f"0x{a:x}: {mn} {ops}{note}")
+        return "\n".join(lines)
+
+    out = []
+    for r in regs:
+        me = f"L_{r[0]['addr']:x}"
+        out.append({
+            "label": me,
+            "asm": "\n".join(render(b) for b in r),
+            "succs": sorted({label_of[d] for b in r for d in b["succs"]
+                             if label_of.get(d) != me}),
+            "end": r[-1]["end"],
+        })
+    return out
+
+
+def _region_roles(rec: dict, regions: list[dict], chat, embed) -> dict:
+    """Embed regions, cluster, and let the LLM name each group's role —
+    same-role regions (e.g. every escape-char case in a dispatch) get the
+    same label, which steadies per-region lifting. label → role."""
+    try:
+        from .cluster import cluster_functions
+
+        rows = [
+            {"name": r["label"], "vector": v}
+            for r, v in zip(regions, embed(
+                [f"asm region in {rec['name']}:\n{r['asm']}"
+                 for r in regions]))
+        ]
+        groups = cluster_functions(rows, threshold=0.20)
+    except Exception:
+        return {}
+    roles = {}
+    for g in groups:
+        sample = "\n---\n".join(
+            next(r["asm"] for r in regions if r["label"] == m["name"])
+            for m in g[:2]
+        )
+        res = _extract_json("".join(chat([
+            {"role": "user", "content": (
+                "These asm regions share a role inside one function. "
+                "Reply with JSON {\"label\": \"2-4 word role\"}.\n\n"
+                + sample)
+            },
+        ], temp=0.0))) or {}
+        for m in g:
+            roles[m["name"]] = res.get("label") or "unlabeled"
+    return roles
+
+
+def _lift_region_once(
+    rec: dict, region: dict, role: str | None,
+    symbols: dict, known: set, chat,
+) -> str | None:
+    """One region → labeled C statements (validated like a whole lift)."""
+    callee_sigs = [
+        symbols[c]["signature"] for c in rec["callees"] if c in symbols
+    ]
+    prompt = (
+        f"You are lifting region {region['label']} of {rec['name']} "
+        f"({rec['signature']}) to C.\n"
+        + (f"Region role: {role}.\n" if role else "")
+        + (f"Already-lifted callees — call these names:\n  "
+           + "\n  ".join(callee_sigs) + "\n" if callee_sigs else "")
+        + "Call targets are annotated `// name` in the asm — call those "
+        "exact names; DAT_* tokens stay verbatim.\n"
+        "Emit ONLY the C statements — no function header, no label, no "
+        "JSON, no markdown fence, no __asm__. Registers are locals: "
+        "`mov x20, x0` → `long v20 = a0;`, stack setup can collapse to a "
+        "short comment.\n"
+        "End the block to match its control flow:\n"
+        f"  successors: {', '.join(region['succs']) or 'none'}; "
+        f"exit kind: {region['end']}\n"
+        "  jump  → `goto L_x;`\n"
+        "  cond  → `if (cond) goto L_t;` then fallthrough statements\n"
+        "  ret   → `return ...;`\n"
+        "  indirect → `/* indirect branch (jump table?) */` + best-effort "
+        "switch or goto\n\n```asm\n" + region["asm"] + "\n```"
+    )
+    def grab(raw: str) -> str:
+        # raw C text expected — tolerate a fence or a stray JSON wrapper
+        raw = raw.strip()
+        if raw.startswith("```"):
+            raw = re.sub(r"^```\w*\n?|\n?```\s*$", "", raw).strip()
+        j = _extract_json(raw)
+        if j and isinstance(j.get("code"), str):
+            return j["code"].strip()
+        return raw
+
+    msgs = [
+        {"role": "system", "content":
+         "Lift one asm region to C statements. Emit ONLY the statements — "
+         "no function header, no label, no JSON, no markdown, no prose."},
+        {"role": "user", "content": prompt},
+    ]
+    nested = re.compile(
+        r"\b(?:void|int|char|long|static|bool|FILE|size_t)\b"
+        r"[\w\s\*]*\w+\s*\([^;{}]*\)\s*\{"
+    )
+
+    def violations(c: str) -> list[str]:
+        v = [f"invented calls: {', '.join(b)}"
+             for b in [_unresolved(c, known, "")] if b]
+        if nested.search(c):
+            v.append("function definition inside statements — emit "
+                     "statements only")
+        return v
+
+    raw = "".join(chat(msgs))
+    code = grab(raw)
+    if not code or "0x" not in code and ";" not in code:
+        return None
+    why = violations(code)
+    if why:
+        msgs += [
+            {"role": "assistant", "content": raw},
+            {"role": "user", "content":
+             "Rejected: " + "; ".join(why) +
+             ". Emit the corrected statements."},
+        ]
+        raw2 = "".join(chat(msgs))
+        c2 = grab(raw2)
+        if c2 and not violations(c2):
+            code = c2
+    return code
+
+
+def _lift_regions(
+    rec: dict, symbols: dict, known: set, chat, embed=None,
+    store: Store | None = None, sha256: str = "",
+) -> dict | None:
+    """Region-by-region lift for functions too large for one emit."""
+    addr_names = {}
+    if store is not None and sha256:
+        addr_names = {
+            int(r["address"], 16): r["name"]
+            for r in store.list_functions(sha256, limit=100000)
+            if r.get("address")
+        }
+    regions = _regions(rec, addr_names)
+    if len(regions) < 2:
+        return None
+    roles = _region_roles(rec, regions, chat, embed) if embed else {}
+    pieces = []
+    for r in regions:
+        code = _lift_region_once(rec, r, roles.get(r["label"]),
+                                 symbols, known, chat)
+        # a region that won't lift keeps its asm inline — degrades the
+        # function instead of failing it outright
+        if code is None:
+            code = "/* unlifted asm:\n" + r["asm"] + "\n*/"
+        pieces.append(f"{r['label']}:\n{code}")
+    res = _extract_json("".join(chat([
+        {"role": "user", "content": (
+            f"A function was lifted region-by-region; region roles: "
+            f"{sorted(set(roles.values())) or ['unknown']}. Its asm does: "
+            f"{'; '.join(rec['strings'][:5]) or 'no strings'}. Reply with "
+            "JSON {\"name\": \"snake_case_name\", \"doc\": \"one line\"}."
+        )},
+    ], temp=0.0))) or {}
+    name = re.sub(r"\W+", "_", res.get("name") or "").strip("_") \
+        or rec["name"]
+    sig = rec["signature"].replace(rec["name"], name, 1)
+    return {
+        "name": name,
+        "signature": sig,
+        "doc": res.get("doc") or "",
+        "code": f"{sig} {{\n" + "\n".join(pieces) + "\n}",
+    }
+
+
 def _lift_prompt(rec: dict, symbols: dict) -> list[dict]:
     callee_sigs = [
         symbols[c]["signature"] for c in rec["callees"] if c in symbols
@@ -288,6 +514,7 @@ def lift_binary(
     out_dir: Path,
     limit: int = 0,
     on_progress=None,
+    embed=None,
 ) -> tuple[Path, dict]:
     """Lift every decompiled function in `sha256`. Returns (out_dir, symbols)."""
     rows = [
@@ -376,6 +603,27 @@ def lift_binary(
                         res, code = agent_res, agent_res["code"]
                         new_name = a_new
                         signature = agent_res.get("signature") or signature
+        if "code" not in res:
+            # flat emit produced nothing parseable — the agent's emit()
+            # is itself a lift attempt with tool feedback
+            agent_res = _agent_lift(rec, symbols, [], store, sha256, chat)
+            if agent_res:
+                res, code = agent_res, agent_res["code"]
+                new_name = agent_res.get("name") or new_name
+                signature = agent_res.get("signature") or signature
+                n_bad = defects(code, new_name)
+        # tier 4: big functions the monolithic emit can't hold → split into
+        # embedded+clustered regions, lift each, stitch with goto edges
+        if ("code" not in res or n_bad) and _is_big(rec):
+            reg = _lift_regions(rec, symbols, known, chat, embed,
+                                store, sha256)
+            if reg and "code" in reg:
+                r_new = reg.get("name") or new_name
+                if ("code" not in res
+                        or defects(reg["code"], r_new) < n_bad):
+                    res, code = reg, reg["code"]
+                    new_name = r_new
+                    signature = reg.get("signature") or signature
         if new_name in used_names:
             n = 2
             while f"{new_name}_{n}" in used_names:
@@ -578,6 +826,7 @@ def lift_binary_clustered(
     threshold: float = 0.25,
     limit: int = 0,
     on_progress=None,
+    embed=None,
 ) -> tuple[Path, dict]:
     """Clustered whole-binary lift. Returns (out_dir, symbols)."""
     from .cluster import cluster_functions
@@ -690,6 +939,26 @@ def lift_binary_clustered(
                             r2, code = agent_res, agent_res["code"]
                             new_name = a_new
                             signature = agent_res.get("signature") or signature
+            if "code" not in r2:
+                agent_res = _agent_lift(
+                    rec, symbols, [], store, sha256, chat
+                )
+                if agent_res:
+                    r2, code = agent_res, agent_res["code"]
+                    new_name = agent_res.get("name") or new_name
+                    signature = agent_res.get("signature") or signature
+                    n_bad = defects(code, new_name)
+            # tier 4: oversized member → regional decomposition + stitch
+            if ("code" not in r2 or n_bad) and _is_big(rec):
+                reg = _lift_regions(rec, symbols, known, chat, embed,
+                                    store, sha256)
+                if reg and "code" in reg:
+                    r_new = reg.get("name") or new_name
+                    if ("code" not in r2
+                            or defects(reg["code"], r_new) < n_bad):
+                        r2, code = reg, reg["code"]
+                        new_name = r_new
+                        signature = reg.get("signature") or signature
             if new_name in used_names:
                 n = 2
                 while f"{new_name}_{n}" in used_names:

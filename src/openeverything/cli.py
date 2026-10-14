@@ -325,12 +325,24 @@ def lift(
 
         lift_fn = lift_binary_clustered if clustered else lift_binary
         kw = {"threshold": threshold} if clustered else {}
+        # embedder loads lazily — only the tier-4 regional path needs it
+        # (oversized functions that fail the monolithic emit)
+        _emb = {}
+
+        def embed(texts):
+            if "e" not in _emb:
+                _emb["e"] = _embedder()
+            return _emb["e"].embed(texts)
+
         out_dir, symbols = lift_fn(
             store, sha, name,
-            chat=lambda m, tools=None, temp=None: llm.chat(m, model=llm_model, tools=tools, temp=temp),
+            chat=lambda m, tools=None, temp=None: llm.chat(
+                m, model=llm_model, tools=tools, temp=temp,
+                max_tokens=4096),
             out_dir=out / name,
             limit=limit,
             on_progress=on_prog,
+            embed=embed,
             **kw,
         )
     failed = sum(1 for s in symbols.values() if s["failed"])

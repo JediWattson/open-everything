@@ -36,6 +36,69 @@ def _branch_target(ops: str) -> int | None:
     return int(ms[-1], 16) if ms else None
 
 
+def blocks_of(asm: str) -> list[dict]:
+    """Basic blocks in address order:
+    {addr, insns: [(addr, mn, ops)], succs: [leader addrs], end}.
+    end ∈ ret | indirect | cond | jump | fall — how control leaves the
+    block (jump = unconditional b, fall = straight-line)."""
+    insns = _parse_instructions(asm)
+    if not insns:
+        return []
+    lo, hi = insns[0][0], insns[-1][0]
+    targets = {
+        t for _, mn, ops in insns
+        if (mn == "b" or _COND.match(mn))
+        for t in [_branch_target(ops)] if t is not None and lo <= t <= hi
+    }
+    leaders = {insns[0][0]} | targets | {
+        insns[i + 1][0]
+        for i, (_, mn, _) in enumerate(insns[:-1])
+        if mn in ("b", "br") or mn.startswith("ret") or _COND.match(mn)
+    }
+    leader_of = {}
+    cur = insns[0][0]
+    for a, _, _ in insns:
+        if a in leaders:
+            cur = a
+        leader_of[a] = cur
+
+    order: list[int] = []
+    grouped: dict[int, list] = {}
+    for insn in insns:
+        lead = leader_of[insn[0]]
+        if lead not in grouped:
+            grouped[lead] = []
+            order.append(lead)
+        grouped[lead].append(insn)
+
+    out = []
+    for i, lead in enumerate(order):
+        b_insns = grouped[lead]
+        a, mn, ops = b_insns[-1]
+        fall = order[i + 1] if i + 1 < len(order) else None
+        succs: list[int] = []
+        end = "fall"
+        if mn.startswith("ret"):
+            end = "ret"
+        elif mn == "br":
+            end = "indirect"
+        else:
+            t = (_branch_target(ops) if (mn == "b" or _COND.match(mn))
+                 else None)
+            if t is not None and t in leader_of:
+                succs.append(leader_of[t])
+                end = "cond" if _COND.match(mn) else "jump"
+            elif mn == "b":
+                end = "ret"  # branch out of function — tail call / exit
+            if end == "cond" and fall is not None:
+                succs.append(fall)
+            elif end == "fall" and fall is not None:
+                succs.append(fall)
+        out.append({"addr": lead, "insns": b_insns,
+                    "succs": sorted(set(succs)), "end": end})
+    return out
+
+
 def function_cfg(asm: str) -> dict:
     """Return {blocks, edges, cyclomatic, loops, indirect_branches} for one
     function's stored asm text."""
