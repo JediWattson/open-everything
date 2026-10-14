@@ -21,9 +21,9 @@ err = Console(stderr=True)
 
 
 def _embedder(model: str | None = None):
-    from .embed import Embedder
+    from .embed import make_embedder
 
-    return Embedder(model)
+    return make_embedder(model)
 
 
 def _run_log(kind: str) -> Path:
@@ -49,12 +49,13 @@ def ingest(
     force: bool = typer.Option(False, "--force", "-f", help="Re-ingest even if sha256 already indexed"),
     model: str | None = typer.Option(None, "--model", "-m", help="Embedding model (default: OE_EMBED_MODEL)"),
     frontend: str = typer.Option("ghidra", "--frontend", help="ghidra | disasm (Ghidra-free: LC_FUNCTION_STARTS + otool)"),
+    defer_embed: bool = typer.Option(False, "--defer-embed", help="Extract only — store rows with NULL vectors, backfill later with `oe embed`"),
 ):
     """Decompile binaries and index their functions."""
     # NB: load the embedder BEFORE opening LanceDB/SQLite — importing those
     # native libs first makes torch's CPU->MPS weight upload take a
     # pathological per-tensor sync-copy path on this platform.
-    embedder = _embedder(model)
+    embedder = None if defer_embed else _embedder(model)
     store = Store()
     graph = GraphStore()
     for binary in binaries:
@@ -72,11 +73,47 @@ def ingest(
                 binary, store, embedder, name=name if len(binaries) == 1 else None,
                 force=force, on_progress=on_prog, graph=graph,
                 frontend=frontend,
+                model_name=model or config.DEFAULT_EMBED_MODEL,
             )
         if n == 0:
             console.print(f"[yellow]skip[/] {binary.name} (already indexed, use --force)")
         else:
             console.print(f"[green]ok[/] {binary.name}: {n} functions (sha {sha[:12]}…)")
+
+
+@app.command()
+def embed(
+    binaries: list[str] = typer.Argument(None, help="Restrict to these binaries (default: all rows missing vectors)"),
+    model: str | None = typer.Option(None, "--model", "-m", help="Embedding model (default: OE_EMBED_MODEL)"),
+):
+    """Backfill vectors for rows ingested with --defer-embed."""
+    store = Store()
+    shas = [_resolve_sha(store, b) for b in binaries] if binaries else [None]
+    pending = []
+    for sha in shas:
+        pending += store.missing_vectors(binary_sha256=sha)
+    if not pending:
+        console.print("[green]nothing to embed[/] — all rows have vectors")
+        return
+
+    # Rows are stamped with their intended model at ingest; one `oe embed`
+    # run per distinct model so dims never mix.
+    by_model: dict[str, list[dict]] = {}
+    for r in pending:
+        by_model.setdefault(r["model"] or config.DEFAULT_EMBED_MODEL, []).append(r)
+    for m, rows in by_model.items():
+        console.print(f"[cyan]embedding[/] {len(rows)} functions with {m}")
+        emb = _embedder(model or m)
+        batch = int(os.environ.get("OE_EMBED_BATCH", "16"))
+        with Progress() as prog:
+            task = prog.add_task(m, total=len(rows))
+            for i in range(0, len(rows), batch):
+                chunk = rows[i : i + batch]
+                vecs = emb.embed_docs([r["embed_text"] for r in chunk])
+                for r, v in zip(chunk, vecs):
+                    store.set_vector(r["name"], r["binary_sha256"], list(v))
+                prog.advance(task, len(chunk))
+    console.print(f"[green]ok[/] {len(pending)} vectors written")
 
 
 @app.command()
@@ -321,8 +358,10 @@ def match(
     rows = match_binaries(store, sha_a, sha_b, model or "")
     table = Table(a, "→", b, "sim", "fpd", "verdict", title=f"{a} × {b}")
     for r in rows[:limit]:
-        color = {"same": "green", "similar": "yellow", "novel": "red"}[r["verdict"]]
-        table.add_row(r["a_name"], "→", r["b_name"], f"{r['sim']:.3f}",
+        color = {"same": "green", "similar": "yellow",
+                 "structural": "cyan", "novel": "red"}[r["verdict"]]
+        table.add_row(r["a_name"], "→", r["b_name"],
+                      "-" if r["sim"] is None else f"{r['sim']:.3f}",
                       "-" if r["fpd"] is None else f"{r['fpd']:.2f}",
                       f"[{color}]{r['verdict']}[/]")
     console.print(table)

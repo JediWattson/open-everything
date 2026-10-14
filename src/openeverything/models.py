@@ -21,7 +21,7 @@ class FunctionRecord:
     size: int = 0         # function body size in bytes
     model: str = ""
     embed_text: str = ""
-    vector: list[float] = field(default_factory=list)
+    vector: list[float] | None = None  # None = deferred embedding (oe embed)
 
     def to_row(self) -> dict:
         return asdict(self)

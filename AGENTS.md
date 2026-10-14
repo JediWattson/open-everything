@@ -69,10 +69,19 @@ Notes:
   `ghidra-projects/`. It must not contain hidden path elements (`.*`) —
   Ghidra's `ProjectLocator` rejects them.
 - Embedding model: `Qodo/Qodo-Embed-1-1.5B` by default (code-specialized,
-  bidirectional attention, 1536-dim). Its bundled remote code predates
-  transformers 5.x, so `Embedder` falls back to the native qwen2 arch and
-  patches `create_causal_mask` -> `create_bidirectional_mask` when
-  `config.is_causal` is false (`embed.py:_force_bidirectional`).
+  bidirectional attention, 1536-dim). Two backends (`OE_EMBED_BACKEND`):
+  `mlx` (default) loads the bare Qwen2 backbone + safetensors via mlx_lm
+  with a padding-mask patch for bidirectional attention (`embed.py:
+  MlxEmbedder`); `st`/`torch` is the SentenceTransformer path, which falls
+  back to the native qwen2 arch and patches `create_causal_mask` ->
+  `create_bidirectional_mask` (`embed.py:_force_bidirectional`) since the
+  bundled remote code predates transformers 5.x. Vectors are
+  interchangeable across backends (cosine ~0.999 on the same doc).
+- `oe ingest --defer-embed` stores function rows with `vector = NULL` —
+  extraction is seconds and model-free; `oe embed` backfills later.
+  `oe match` treats a NULL vector as "no semantic evidence" and can rank
+  on fingerprint alone (fpd column). Rows remember their intended `model`
+  so `oe embed` batches by model.
 - Device: MPS (Metal) is auto-detected; `OE_DEVICE=cpu` forces CPU. On MPS the
   model loads bf16 — fp32 OOMs a 16 GB unified-memory Mac. Embed batch is 16
   for the same reason.
@@ -93,6 +102,8 @@ Notes:
 oe ingest <binary>... [--force] [-m model]      # decompile + embed + index
 oe ingest --frontend disasm <bin>...            # Ghidra-free: LC_FUNCTION_STARTS
                                     # + otool arm64 asm + stub names (no JVM)
+oe ingest --defer-embed <bin>...                # extract only, vectors=NULL
+oe embed [bin...] [-m model]                    # backfill NULL vectors
 oe search "<query>" [-k N] [-b bin] [-m model] [--code] [--all]
 oe show <func> -b <binary>          # print pseudocode
 oe graph <func> -b <binary> [-d N] [--callers]   # transitive call graph

@@ -129,3 +129,127 @@ class Embedder:
 
     def embed(self, texts: list[str]) -> list[list[float]]:
         return self.embed_docs(texts)
+
+
+class MlxEmbedder:
+    """mlx-lm-backed embedder — same interface as Embedder, Apple-silicon
+    native memory behaviour (lazy weights, cache limits) instead of MPS.
+
+    Qodo-Embed is Qwen2-arch with is_causal=false: bidirectional attention.
+    mlx's scaled_dot_product_attention with mask=None is already full
+    attention, so the only patch needed is suppressing the causal mask
+    Qwen2Model builds internally — plus a padding mask when batching.
+    Pooling is last-non-pad-token (1_Pooling: pooling_mode_lasttoken).
+    """
+
+    def __init__(self, model_name: str | None = None):
+        import glob
+        import json
+
+        import mlx.core as mx
+        from huggingface_hub import snapshot_download
+        from mlx_lm.models import qwen2
+
+        self._mx = mx
+        self.model_name = model_name or config.DEFAULT_EMBED_MODEL
+        path = snapshot_download(self.model_name, allow_patterns=[
+            "*.safetensors", "*.json", "*.txt"])
+        with open(f"{path}/config.json") as f:
+            args = qwen2.ModelArgs.from_dict(json.load(f))
+        self._model = qwen2.Qwen2Model(args)  # backbone only, no lm_head
+        weights = {}
+        for shard in sorted(glob.glob(f"{path}/*.safetensors")):
+            weights.update(mx.load(shard))
+        self._model.load_weights(list(weights.items()), strict=True)
+        self._bf16()
+
+        from transformers import AutoTokenizer
+
+        self._tokenizer = AutoTokenizer.from_pretrained(path)
+        # max window for tokenization — docs are already capped by
+        # _MAX_BODY_CHARS, so this only bounds pathological inputs
+        self._max_len = int(os.environ.get("OE_MLX_MAX_LEN", "2048"))
+        self._pad_lens: mx.array | None = None
+        self._patch_bidirectional()
+        self.dim = int(args.hidden_size)
+
+    def _bf16(self) -> None:
+        from mlx.utils import tree_map
+
+        mx = self._mx
+        params = tree_map(
+            lambda p: p.astype(mx.bfloat16), self._model.parameters()
+        )
+        self._model.update(params)
+
+    def _patch_bidirectional(self) -> None:
+        """Qwen2Model.__call__ hardcodes create_attention_mask(h, cache) —
+        swap it for a padding-only mask (or None when unpadded)."""
+        import mlx.core as mx
+
+        mod = __import__(self._model.__module__, fromlist=["x"])
+        orig = getattr(mod, "create_attention_mask", None)
+        if orig is None or getattr(orig, "_oe_patched", False):
+            return
+        embedder = self
+
+        def mask_fn(h, cache=None, *args, **kwargs):
+            lens = embedder._pad_lens
+            if lens is None:
+                return None  # full bidirectional, no padding
+            L = h.shape[1]
+            keep = mx.arange(L)[None, :] < lens[:, None]
+            return mx.where(keep, 0.0, -mx.inf)[:, None, None, :].astype(
+                h.dtype
+            )
+
+        mask_fn._oe_patched = True
+        mod.create_attention_mask = mask_fn
+
+    def _encode(self, texts: list[str]) -> list[list[float]]:
+        mx = self._mx
+        ids = [
+            self._tokenizer.encode(t)[: self._max_len] for t in texts
+        ]
+        lens = mx.array([len(i) for i in ids])
+        L = max(len(i) for i in ids)
+        pad = getattr(self._tokenizer, "pad_token_id", None) or 0
+        batch = mx.array(
+            [i + [pad] * (L - len(i)) for i in ids], dtype=mx.int32
+        )
+        self._pad_lens = lens
+        try:
+            h = self._model(batch)  # [B, L, D] post-norm hidden states
+        finally:
+            self._pad_lens = None
+        pooled = h[mx.arange(len(ids)), lens - 1]
+        pooled = pooled / mx.linalg.norm(pooled, axis=-1, keepdims=True)
+        mx.eval(pooled)
+        return pooled.tolist()
+
+    def embed_docs(self, texts: list[str]) -> list[list[float]]:
+        return self._encode(texts)
+
+    def embed_query(self, text: str) -> list[float]:
+        return self._encode([text])[0]
+
+    def embed(self, texts: list[str]) -> list[list[float]]:
+        return self.embed_docs(texts)
+
+
+def make_embedder(model_name: str | None = None):
+    """Backend pick: OE_EMBED_BACKEND=mlx|st forces, default auto-tries mlx
+    (native memory behaviour) and falls back to SentenceTransformer."""
+    backend = os.environ.get("OE_EMBED_BACKEND", "auto")
+    if backend == "st":
+        return Embedder(model_name)
+    if backend == "mlx":
+        return MlxEmbedder(model_name)
+    try:
+        return MlxEmbedder(model_name)
+    except Exception as e:
+        import sys
+
+        print(f"[embed] mlx backend unavailable ({e}); using torch/ST",
+              file=sys.stderr)
+        return Embedder(model_name)

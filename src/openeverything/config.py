@@ -17,6 +17,14 @@ TABLE_NAME = "functions"
 DEFAULT_EMBED_MODEL = os.environ.get(
     "OE_EMBED_MODEL", "Qodo/Qodo-Embed-1-1.5B"
 )
+
+# Embedding dims per model — needed to declare the fixed-size vector column
+# when the first ingest is deferred (no model loaded to ask).
+MODEL_DIMS = {
+    "Qodo/Qodo-Embed-1-1.5B": 1536,
+    "unsloth/embeddinggemma-300m": 768,
+    "google/embeddinggemma-300m": 768,
+}
 DECOMPILE_TIMEOUT_S = int(os.environ.get("OE_DECOMPILE_TIMEOUT", "60"))
 
 _DIRECT_CANDIDATES = [

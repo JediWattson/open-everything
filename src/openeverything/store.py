@@ -38,8 +38,49 @@ class Store:
         rows = [r.to_row() for r in recs]
         if config.TABLE_NAME in self._db.list_tables().tables:
             self._table().add(rows)
+        elif all(r["vector"] is None for r in rows):
+            # All-deferred batch on a fresh DB: declare the vector column
+            # explicitly or it'd be created as a Null-type, unbackfillable.
+            import pyarrow as pa
+
+            dim = config.MODEL_DIMS.get(recs[0].model)
+            if dim is None:
+                raise ValueError(
+                    f"unknown dim for model {recs[0].model!r} — add it to "
+                    "config.MODEL_DIMS or run `oe embed` first"
+                )
+            fields = [
+                pa.field(k, pa.infer_type(pa.array([r[k] for r in rows])))
+                for k in rows[0]
+                if k != "vector"
+            ]
+            fields.append(pa.field("vector", pa.list_(pa.float32(), dim)))
+            self._db.create_table(
+                config.TABLE_NAME, rows, schema=pa.schema(fields)
+            )
         else:
             self._db.create_table(config.TABLE_NAME, rows)
+
+    def missing_vectors(
+        self, binary_sha256: str | None = None, model: str | None = None
+    ) -> list[dict]:
+        """Rows with vector IS NULL — ingested with --defer-embed."""
+        if config.TABLE_NAME not in self._db.list_tables().tables:
+            return []
+        conds = ["vector IS NULL"]
+        if binary_sha256:
+            conds.append(f"binary_sha256 = '{binary_sha256}'")
+        if model:
+            conds.append(f"model = '{model}'")
+        return self._table().search().where(" AND ".join(conds)).to_list()
+
+    def set_vector(
+        self, name: str, binary_sha256: str, vector: list[float]
+    ) -> None:
+        self._table().update(
+            where=f"name = '{name}' AND binary_sha256 = '{binary_sha256}'",
+            values={"vector": vector},
+        )
 
     def register_binary(
         self, sha256: str, name: str, path: str, n_functions: int

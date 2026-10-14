@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 from pathlib import Path
 
-from .embed import Embedder, build_embed_text
+from .embed import Embedder, MlxEmbedder, build_embed_text
 from .extractor import extract_functions
 from .graph import GraphStore
 from .models import FunctionRecord
@@ -23,12 +23,13 @@ def sha256_file(path: Path) -> str:
 def ingest(
     binary: Path,
     store: Store,
-    embedder: Embedder,
+    embedder: Embedder | MlxEmbedder | None,
     name: str | None = None,
     force: bool = False,
     on_progress=None,
     graph: GraphStore | None = None,
     frontend: str = "ghidra",
+    model_name: str | None = None,
 ) -> tuple[str, int]:
     """Ingest one binary. Returns (binary_sha256, n_functions)."""
     binary = binary.resolve()
@@ -53,16 +54,20 @@ def ingest(
         extract(binary, sha, name, on_progress=on_progress)
     )
     for r in recs:
-        r.model = embedder.model_name
+        # embedder=None -> deferred embedding (`oe ingest --defer-embed`):
+        # rows land with vector=NULL and `model` naming the model `oe embed`
+        # will fill them with, so search/match can filter correctly meanwhile.
+        r.model = model_name or (embedder.model_name if embedder else "")
         r.embed_text = build_embed_text(r)
 
-    import os
+    if embedder is not None:
+        import os
 
-    batch = int(os.environ.get("OE_EMBED_BATCH", "16"))
-    for i in range(0, len(recs), batch):
-        vecs = embedder.embed_docs([r.embed_text for r in recs[i : i + batch]])
-        for r, v in zip(recs[i : i + batch], vecs):
-            r.vector = v
+        batch = int(os.environ.get("OE_EMBED_BATCH", "16"))
+        for i in range(0, len(recs), batch):
+            vecs = embedder.embed_docs([r.embed_text for r in recs[i : i + batch]])
+            for r, v in zip(recs[i : i + batch], vecs):
+                r.vector = v
 
     store.add_functions(recs)
     if graph is not None:
